@@ -1,0 +1,874 @@
+
+###################################################################
+#----- jBiWeibull; prop 1st comp; same 2nd comp; fi0.8; extr -----#
+###################################################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Nice plots
+library(ggplot2)
+
+# Kaplan-Meier and empirical hazard estimate
+library(survival)
+library(muhaz)
+
+# Gauss-Kronrod quadrature
+library(pracma)
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+## Functions ##
+
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+# Functions for the log-hazard and log-survival function of a Weibull distribution
+# 
+# x     : time of event or censoring
+# shape : shape parameter of the distribution
+# rate  : rate parameter of the distribution (actually it is a mix of rate and scale)
+# 
+h_weib <- function(x, shape, rate){
+  h <- rate * shape * x^(shape - 1)
+  
+  return(h)
+}
+logS_weib <- function(x, shape, rate){
+  logS <- - rate * x^shape
+  
+  return(logS)
+}
+
+
+#####
+# Data
+
+
+# The whole dataset
+dat <- read.csv("brca_metabric_clinical_data.txt", header = TRUE, sep = "\t")
+unique(dat$Sex) # only females
+
+# Keep only time, status and age
+dat_d <- data.frame(matrix(NA, nrow(dat), 3)); colnames(dat_d) <- c("time", "status", "age")
+
+dat_d[, 1] <- dat$Overall.Survival..Months.
+dat_d[, 2] <- dat$Overall.Survival.Status # 0=censor , 1=event (death)
+dat_d[, 3] <- dat$Age.at.Diagnosis
+str(dat_d)
+
+# Some rows are NA's for both time and status
+tfna <- apply(dat_d, 2, is.na)
+all(which(tfna[, 1] == TRUE) == which(tfna[, 2] == TRUE))
+
+# Remove NA's
+dat_d <- dat_d[c(!tfna[, 1]), ]
+
+# Make status numeric
+for(i in 1:nrow(dat_d)){
+  if(dat_d$status[i] == "0:LIVING"){
+    dat_d$status[i] <- 0
+  } else {
+    dat_d$status[i] <- 1
+  }
+}
+dat_d$status <- as.numeric(dat_d$status)
+
+# It has event time = 0
+dat_d <- dat_d[-186, ]
+dat_d <- dat_d[order(dat_d$time), ]
+rownames(dat_d) <- 1:nrow(dat_d)
+
+# Ages in the study
+dat_d$age <- floor(dat_d$age)
+
+
+## External population ##
+
+
+# Load the next year survival matrix
+source("surv_f.R")
+
+# Proportions for every age
+props <- table(dat_d$age) / sum(table(dat_d$age))
+
+# Keep only the ages of the dataset
+surv <- surv_f[, 1+sort(unique(dat_d$age))]
+
+# Weighted average of next year survival
+weighted.mean <- function(x){
+  sum(x*props, na.rm = TRUE)/sum(props)
+}
+w.surv <- apply(surv, 1, weighted.mean)
+
+# Generate times to event
+set.seed(123456)
+Npop <- 5e3
+atrisk <- numeric(length(w.surv))
+sumev <- numeric(length(w.surv))
+atrisk[1] <- Npop
+sumev[1] <- round(atrisk[1] - w.surv[1]*atrisk[1])
+for(i in 2:length(w.surv)){
+  atrisk[i] <- atrisk[i-1] - sumev[i-1]
+  sumev[i] <- round((w.surv[i-1]*atrisk[i] - w.surv[i]*atrisk[i]) / w.surv[i-1]) # number of events at each time
+}
+atrisk[which(is.nan(atrisk))] <- 0
+sumev[which(is.nan(sumev))] <- 0
+timetoev <- NULL
+for(i in 1:length(sumev)){
+  times.ext <- runif(sumev[i], (i-1)*12, i*12) # convert annual events to monthly events
+  timetoev <- c(timetoev, sort(times.ext)) # times to event for the external population
+}
+
+
+#####
+# Non-parametrics
+
+
+# KM, NA and empirical hazard for the diseaase population
+km.fit_d <- survfit(Surv(time, status) ~ 1, data = dat_d)
+naest_d <- cumsum(km.fit_d$n.event/km.fit_d$n.risk)
+emp.haz_d <- muhaz(dat_d$time, dat_d$status)$haz.est # max time is 355.2 months (307.63 is used)
+emp.haz_d.times <- muhaz(dat_d$time, dat_d$status)$est.grid
+
+# KM, NA and empirical hazard for the external population
+dat_pop <- data.frame(time = timetoev,
+                      status = 1)
+km.fit_pop <- survfit(Surv(time, status) ~ 1, data = dat_pop)
+naest_pop <- cumsum(km.fit_pop$n.event/km.fit_pop$n.risk)
+emp.haz_pop <- muhaz(dat_pop$time, dat_pop$status)$haz.est # max time is 999.769 months (818.88 is used)
+emp.haz_pop.times <- muhaz(dat_pop$time, dat_pop$status)$est.grid
+
+# KM, NA and empirical hazard for the new disease population
+frac.info <- cumsum(km.fit_d$n.event) / sum(km.fit_d$n.event)
+eve.dat <- data.frame(time = km.fit_d$time,
+                      surv = km.fit_d$surv,
+                      neve = km.fit_d$n.event)
+last.time_f0.8 <- min(eve.dat$time[frac.info > 0.8])
+last.pers_f0.8 <- max(which(dat_d$time == last.time_f0.8))
+dat_d1 <- dat_d
+for(i in 1:nrow(dat_d1)){
+  if(dat_d1$time[i] > last.time_f0.8){
+    dat_d1$time[i] <- dat_d$time[last.pers_f0.8]
+    dat_d1$status[i] <- 0
+  }
+}
+km.fit1_d <- survfit(Surv(time, status) ~ 1, data = dat_d1) # KM for the new disease population
+naest1_d <- cumsum(km.fit1_d$n.event/km.fit1_d$n.risk) # NA for the new disease population
+emp.haz1_d <- muhaz(dat_d1$time, dat_d1$status, max.time = dat_d1$time[which(dat_d$time == last.time_f0.8)])$haz.est
+emp.haz1_d.times <- muhaz(dat_d1$time, dat_d1$status, max.time = dat_d1$time[which(dat_d$time == last.time_f0.8)])$est.grid
+
+
+#####
+# Extrapolation
+
+
+dat_d1 <- dat_d1[order(dat_d1$time), -3]; rownames(dat_d1) <- 1:nrow(dat_d1)
+
+# The fitted model
+nuts_fit <- readRDS("jBiWeib_prop_1st_comp_same_2nd_comp.rds")
+
+# Extract posterior samples
+stan_warmup <- 500
+stan_iter <- 5e3 + stan_warmup
+post <- extract(nuts_fit,
+                pars = c("alpha_pop", "lambda_pop", "C"),
+                permuted = FALSE,
+                inc_warmup = TRUE,
+                include = TRUE)
+post_no_warm <- post[(stan_warmup+1):dim(post)[1], , ]
+keep <- seq(1, stan_iter - stan_warmup, by = 5) # keep one every 5 samples
+post_noac <- post_no_warm[keep, , ]
+
+# Estimated parameters
+alphas_pop <- rbind(post_noac[, 1, c("alpha_pop[1]", "alpha_pop[2]")],
+                    post_noac[, 2, c("alpha_pop[1]", "alpha_pop[2]")],
+                    post_noac[, 3, c("alpha_pop[1]", "alpha_pop[2]")]) # shapes
+lambdas_pop <- rbind(post_noac[, 1, c("lambda_pop[1]", "lambda_pop[2]")],
+                     post_noac[, 2, c("lambda_pop[1]", "lambda_pop[2]")],
+                     post_noac[, 3, c("lambda_pop[1]", "lambda_pop[2]")]) # rates
+hr <- c(post_noac[, 1, "C"],
+        post_noac[, 2, "C"],
+        post_noac[, 3, "C"]) # hazard ratio for the 1st component
+
+# Estimated survival, hazard, cumulative hazard, density and odds functions
+source("jBiWeib_prop_1st_comp_same_2nd_comp.R")
+attach(save.list)
+
+# Set the extrapolation times
+last.fit.time <- round(dat_d1$time[nrow(dat_d1)])
+ext.horiz <- round(max(dat_pop$time)) # extrapolation until max external time
+extr.times <- last.fit.time+1:(ext.horiz-last.fit.time)
+
+# Fit of disease
+fit.hazard_d <- fit.lsurv_d <- array(NA, dim = c(last.fit.time, nrow(lambdas_pop), ncol(lambdas_pop)))
+fit.times_d <- 1:last.fit.time
+for(i in 1:last.fit.time){
+  for(j in 1:nrow(lambdas_pop)){
+    fit.hazard_d[i, j, 1] <- hr[j] * h_weib(fit.times_d[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    fit.lsurv_d[i, j, 1] <- hr[j] * logS_weib(fit.times_d[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    fit.hazard_d[i, j, 2] <- h_weib(fit.times_d[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+    fit.lsurv_d[i, j, 2] <- logS_weib(fit.times_d[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+  }
+}
+fit.haz_d <- apply(fit.hazard_d, c(1, 2), sum)
+fit.sur_d <- exp(apply(fit.lsurv_d, c(1, 2), sum))
+fit.cumhaz_d <- -apply(fit.lsurv_d, c(1, 2), sum)
+
+# Fit of external
+fit.times_pop <- 1:ext.horiz
+fit.hazard_pop <- fit.logS_pop.t <- array(NA, dim = c(length(fit.times_pop), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:length(fit.times_pop)){
+  for(j in 1:nrow(lambdas_pop)){
+    fit.hazard_pop[i, j, 1] <- h_weib(fit.times_pop[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    fit.logS_pop.t[i, j, 1] <- logS_weib(fit.times_pop[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    fit.hazard_pop[i, j, 2] <- h_weib(fit.times_pop[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+    fit.logS_pop.t[i, j, 2] <- logS_weib(fit.times_pop[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+  }
+}
+tfit.haz_pop <- apply(fit.hazard_pop, c(1, 2), sum)
+tfit.sur_pop <- exp(apply(fit.logS_pop.t, c(1, 2), sum))
+tfit.cumhaz_pop <- -apply(fit.logS_pop.t, c(1, 2), sum)
+
+# Fit of external for the follow-up period
+fit.haz_pop <- tfit.haz_pop[1:last.fit.time, ]
+fit.sur_pop <- tfit.sur_pop[1:last.fit.time, ]
+fit.cumhaz_pop <- tfit.cumhaz_pop[1:last.fit.time, ]
+
+# Fit of external for the extrapolation period
+extr.haz_pop <- tfit.haz_pop[(last.fit.time+1):max(extr.times), ]
+extr.sur_pop <- tfit.sur_pop[(last.fit.time+1):max(extr.times), ]
+extr.cumhaz_pop <- tfit.cumhaz_pop[(last.fit.time+1):max(extr.times), ]
+
+
+## Method 1: Extrapolate the fitted model ##
+
+
+# Extrapolation of disease
+extr.hazard_d <- extr.lsurv_d <- array(NA, dim = c(length(extr.times), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:length(extr.times)){
+  for(j in 1:nrow(lambdas_pop)){
+    extr.hazard_d[i, j, 1] <- hr[j] * h_weib(extr.times[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    extr.lsurv_d[i, j, 1] <- hr[j] * logS_weib(extr.times[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    extr.hazard_d[i, j, 2] <- h_weib(extr.times[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+    extr.lsurv_d[i, j, 2] <- logS_weib(extr.times[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+  }
+}
+extr.haz_d <- apply(extr.hazard_d, c(1, 2), sum)
+extr.sur_d <- exp(apply(extr.lsurv_d, c(1, 2), sum))
+extr.cumhaz_d <- -apply(extr.lsurv_d, c(1, 2), sum)
+
+# Summary statistics
+fit.sur.d.q3 <- apply(fit.sur_d, 1, q3)
+fit.sur.d.q4 <- apply(fit.sur_d, 1, q4)
+fit.sur.d.med <- apply(fit.sur_d, 1, median)
+fit.haz.d.q3 <- apply(fit.haz_d, 1, q3)
+fit.haz.d.q4 <- apply(fit.haz_d, 1, q4)
+fit.haz.d.med <- apply(fit.haz_d, 1, median)
+fit.cumhaz.d.q3 <- apply(fit.cumhaz_d, 1, q3)
+fit.cumhaz.d.q4 <- apply(fit.cumhaz_d, 1, q4)
+fit.cumhaz.d.med <- apply(fit.cumhaz_d, 1, median)
+extr.sur.d.q3 <- apply(extr.sur_d, 1, q3)
+extr.sur.d.q4 <- apply(extr.sur_d, 1, q4)
+extr.sur.d.med <- apply(extr.sur_d, 1, median)
+extr.haz.d.q3 <- apply(extr.haz_d, 1, q3)
+extr.haz.d.q4 <- apply(extr.haz_d, 1, q4)
+extr.haz.d.med <- apply(extr.haz_d, 1, median)
+extr.cumhaz.d.q3 <- apply(extr.cumhaz_d, 1, q3)
+extr.cumhaz.d.q4 <- apply(extr.cumhaz_d, 1, q4)
+extr.cumhaz.d.med <- apply(extr.cumhaz_d, 1, median)
+fit.sur.pop.q3 <- apply(fit.sur_pop, 1, q3)
+fit.sur.pop.q4 <- apply(fit.sur_pop, 1, q4)
+fit.sur.pop.med <- apply(fit.sur_pop, 1, median)
+fit.haz.pop.q3 <- apply(fit.haz_pop, 1, q3)
+fit.haz.pop.q4 <- apply(fit.haz_pop, 1, q4)
+fit.haz.pop.med <- apply(fit.haz_pop, 1, median)
+fit.cumhaz.pop.q3 <- apply(fit.cumhaz_pop, 1, q3)
+fit.cumhaz.pop.q4 <- apply(fit.cumhaz_pop, 1, q4)
+fit.cumhaz.pop.med <- apply(fit.cumhaz_pop, 1, median)
+extr.sur.pop.q3 <- apply(extr.sur_pop, 1, q3)
+extr.sur.pop.q4 <- apply(extr.sur_pop, 1, q4)
+extr.sur.pop.med <- apply(extr.sur_pop, 1, median)
+extr.haz.pop.q3 <- apply(extr.haz_pop, 1, q3)
+extr.haz.pop.q4 <- apply(extr.haz_pop, 1, q4)
+extr.haz.pop.med <- apply(extr.haz_pop, 1, median)
+extr.cumhaz.pop.q3 <- apply(extr.cumhaz_pop, 1, q3)
+extr.cumhaz.pop.q4 <- apply(extr.cumhaz_pop, 1, q4)
+extr.cumhaz.pop.med <- apply(extr.cumhaz_pop, 1, median)
+
+
+# Life years gained #
+
+
+# Mean survival of BC
+xx_d <- c(fit.times_d, extr.times)
+fxx_d <- rbind(fit.sur_d, extr.sur_d)
+area_d <- matrix(NA, nrow = length(xx_d), ncol = ncol(fxx_d))
+for(i in 2:length(xx_d)){
+  for(j in 1:ncol(fxx_d)){
+    area_d[i, j] <- (xx_d[i] - xx_d[i-1])*(fxx_d[i-1, j] + fxx_d[i, j])/2
+  }
+}
+t.area_d <- apply(area_d[-1, ], 2, sum)
+mean(t.area_d)
+
+# Restricted mean survival of external population
+xx_pop <- fit.times_pop
+fxx_pop <- tfit.sur_pop
+area_pop <- matrix(NA, nrow = length(xx_pop), ncol = ncol(fxx_pop))
+for(i in 2:length(xx_pop)){
+  for(j in 1:ncol(fxx_pop)){
+    area_pop[i, j] <- (xx_pop[i] - xx_pop[i-1])*(fxx_pop[i-1, j] + fxx_pop[i, j])/2
+  }
+}
+t.area_pop <- apply(area_pop[-1, ], 2, sum)
+mean(t.area_pop)
+
+# Life years gained
+lyg <- t.area_pop - t.area_d
+ggplot() +
+  geom_line(data = data.frame(x = xx_pop,
+                              y = apply(fxx_pop, 1, median),
+                              z = "external"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = xx_d,
+                              y = apply(fxx_d, 1, median),
+                              z = "BC"),
+            aes(x = x, y = y, color = z)) +
+  geom_vline(xintercept = max(dat_d$time), color = "magenta", linetype = "dotted") +
+  annotate("text", x = max(dat_d$time)+4*12, y = 0.8, label = "follow-up \n end") +
+  geom_ribbon(data = data.frame(x = xx_pop,
+                                low = apply(fxx_d, 1, median),
+                                high = apply(fxx_pop, 1, median),
+                                z = "LYG"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  scale_color_manual(values = c("forestgreen", "blue"),
+                     name = NULL,
+                     breaks = c("external", "BC"),
+                     labels = c("external", "BC")) +
+  scale_fill_manual(values = c("steelblue4"),
+                    name = NULL,
+                    breaks = c("LYG"),
+                    labels = c("LYG")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, round(max(extr.times), -1), by = 36),
+                     labels = seq(0, round(max(extr.times), -1), by = 36)/12) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, round(max(extr.times), -1))) +
+  labs(x = "Time (years)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("lyg.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Survival function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_d,
+                              y = fit.sur.d.med,
+                              z = "BC",
+                              g = "BC"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = extr.times,
+                              y = extr.sur.d.med,
+                              z = "BC_extr",
+                              g = "BC_extr"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = c(fit.times_d, extr.times),
+                              y = c(fit.sur.pop.med, extr.sur.pop.med),
+                              z = "external",
+                              g = "external"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_step(data = data.frame(x = km.fit_d$time,
+                              y = km.fit_d$surv,
+                              z = "KM_BC",
+                              g = "KM_BC"),
+            aes(x = x, y = y, linetype = z, color = g), direction = "hv") +
+  geom_ribbon(data = data.frame(x = fit.times_d,
+                                low = fit.sur.d.q3,
+                                high = fit.sur.d.q4,
+                                z = "95% BC"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = extr.times,
+                                low = extr.sur.d.q3,
+                                high = extr.sur.d.q4,
+                                z = "95% BC_extr"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = c(fit.times_d, extr.times),
+                                low = c(fit.sur.pop.q3, extr.sur.pop.q3),
+                                high = c(fit.sur.pop.q4, extr.sur.pop.q4),
+                                z = "95% external"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  scale_linetype_manual(values = c("solid", "dashed", "solid", "solid"),
+                        name = NULL,
+                        breaks = c("BC", "BC_extr", "external", "KM_BC"),
+                        labels = c("BC", "BC_extr", "external", "KM_BC")) +
+  scale_fill_manual(values = c("dodgerblue", "skyblue", "darkolivegreen3"),
+                    name = NULL,
+                    breaks = c("95% BC", "95% BC_extr", "95% external"),
+                    labels = c("95% BC", "95% BC_extr", "95% external")) +
+  scale_color_manual(values = c("blue", "blue", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("BC", "BC_extr", "external", "KM_BC"),
+                     labels = c("BC", "BC_extr", "external", "KM_BC")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("bc_extr_surv_cri_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_d,
+                              y = fit.haz.d.med,
+                              z = "BC",
+                              g = "BC"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = extr.times,
+                              y = extr.haz.d.med,
+                              z = "BC_extr",
+                              g = "BC_extr"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = c(fit.times_d, extr.times),
+                              y = c(fit.haz.pop.med, extr.haz.pop.med),
+                              z = "external",
+                              g = "external"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = emp.haz_d.times,
+                              y = emp.haz_d,
+                              z = "emp_BC",
+                              g = "emp_BC"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_ribbon(data = data.frame(x = fit.times_d,
+                                low = fit.haz.d.q3,
+                                high = fit.haz.d.q4,
+                                z = "95% BC"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = extr.times,
+                                low = extr.haz.d.q3,
+                                high = extr.haz.d.q4,
+                                z = "95% BC_extr"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = c(fit.times_d, extr.times),
+                                low = c(fit.haz.pop.q3, extr.haz.pop.q3),
+                                high = c(fit.haz.pop.q4, extr.haz.pop.q4),
+                                z = "95% external"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  scale_linetype_manual(values = c("solid", "dashed", "solid", "solid"),
+                        name = NULL,
+                        breaks = c("BC", "BC_extr", "external", "emp_BC"),
+                        labels = c("BC", "BC_extr", "external", "emp_BC")) +
+  scale_fill_manual(values = c("dodgerblue", "skyblue", "darkolivegreen3"),
+                    name = NULL,
+                    breaks = c("95% BC", "95% BC_extr", "95% external"),
+                    labels = c("95% BC", "95% BC_extr", "95% external")) +
+  scale_color_manual(values = c("blue", "blue", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("BC", "BC_extr", "external", "emp_BC"),
+                     labels = c("BC", "BC_extr", "external", "emp_BC")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 0.02, by = 0.004),
+                     labels = seq(0, 0.02, by = 0.004)) +
+  coord_cartesian(ylim = c(0, 0.02), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("bc_extr_haz_cri_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+
+## Method 2: Assume a constant difference h_d-h_pop ##
+
+
+avlast <- 5 # average the last avlast points
+chd <- function(y, x1 = fit.times_d){
+  chd <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chd)
+}
+chd.fitted_d <- apply(fit.haz_d - fit.haz_pop, 2, chd)
+
+del.lag <- 1
+del <- seq(last.fit.time+1, nrow(tfit.haz_pop), by = del.lag)
+extr.haz.del_pop <- tfit.haz_pop[del, ]
+
+# Extrapolate
+mat.chd.del.fitted_d <- matrix(rep(chd.fitted_d, nrow(extr.haz.del_pop)), nrow(extr.haz.del_pop), ncol(extr.haz.del_pop), byrow = TRUE)
+
+extr.chd.del_d_q3 <- apply(extr.haz.del_pop + mat.chd.del.fitted_d, 1, q3)
+extr.chd.del_d_q4 <- apply(extr.haz.del_pop + mat.chd.del.fitted_d, 1, q4)
+extr.chd.del_d_med <- apply(extr.haz.del_pop + mat.chd.del.fitted_d, 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_d <- rbind(fit.cumhaz_d, matrix(0, nrow = nrow(extr.haz.del_pop), ncol = ncol(extr.haz.del_pop)))
+for(i in 1:nrow(extr.haz.del_pop)){
+  textr.cumhaz_d[i+nrow(fit.cumhaz_d), ] <- textr.cumhaz_d[i+nrow(fit.cumhaz_d)-1, ] +
+    {extr.haz.del_pop + mat.chd.del.fitted_d}[i, ]
+}
+def.sur.chd.meth2_d <- exp(-textr.cumhaz_d)[(last.fit.time+1):nrow(textr.cumhaz_d), ]
+
+extr.sur.chd.q3.meth2_d <- apply(def.sur.chd.meth2_d, 1, q3)
+extr.sur.chd.q4.meth2_d <- apply(def.sur.chd.meth2_d, 1, q4)
+extr.sur.chd.med.meth2_d <- apply(def.sur.chd.meth2_d, 1, median)
+
+# Mean survival of BC
+xx_d <- c(fit.times_d, extr.times)
+fxx_d <- rbind(fit.sur_d, def.sur.chd.meth2_d)
+area_d <- matrix(NA, nrow = length(xx_d), ncol = ncol(fxx_d))
+for(i in 2:length(xx_d)){
+  for(j in 1:ncol(fxx_d)){
+    area_d[i, j] <- (xx_d[i] - xx_d[i-1])*(fxx_d[i-1, j] + fxx_d[i, j])/2
+  }
+}
+t.area_d.meth2 <- apply(area_d[-1, ], 2, sum)
+mean(t.area_d.meth2)
+
+# Life years gained
+lyg.meth2 <- t.area_pop - t.area_d.meth2
+
+
+## Method 3: Assume a constant difference h1_d - h1_pop ##
+
+
+chd <- function(y, x1 = fit.times_d){
+  chd <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chd)
+}
+chd.fitted1_d <- apply(fit.hazard_d[, , 1] - fit.hazard_pop[1:last.fit.time, , 1], 2, chd)
+
+del.lag <- 1
+del <- seq(last.fit.time+1, nrow(tfit.haz_pop), by = del.lag)
+extr1.haz.del_pop <- fit.hazard_pop[del, , 1]
+
+# Extrapolate
+mat.chd.del.fitted1_d <- matrix(rep(chd.fitted1_d, nrow(extr1.haz.del_pop)), nrow(extr1.haz.del_pop), ncol(extr1.haz.del_pop), byrow = TRUE)
+
+haz1_d <- extr1.haz.del_pop + mat.chd.del.fitted1_d
+
+extr.chd.del1_d_q3 <- apply(haz1_d + extr.hazard_d[, , 2], 1, q3)
+extr.chd.del1_d_q4 <- apply(haz1_d + extr.hazard_d[, , 2], 1, q4)
+extr.chd.del1_d_med <- apply(haz1_d + extr.hazard_d[, , 2], 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_d <- rbind(fit.cumhaz_d, matrix(0, nrow = nrow(extr1.haz.del_pop), ncol = ncol(extr1.haz.del_pop)))
+for(i in 1:nrow(extr1.haz.del_pop)){
+  textr.cumhaz_d[i+nrow(fit.cumhaz_d), ] <- textr.cumhaz_d[i+nrow(fit.cumhaz_d)-1, ] +
+    {extr1.haz.del_pop + mat.chd.del.fitted1_d + extr.hazard_d[, , 2]}[i, ]
+}
+def.sur.chd.meth3_d <- exp(-textr.cumhaz_d)[(last.fit.time+1):nrow(textr.cumhaz_d), ]
+
+extr.sur.chd.q3.meth3_d <- apply(def.sur.chd.meth3_d, 1, q3)
+extr.sur.chd.q4.meth3_d <- apply(def.sur.chd.meth3_d, 1, q4)
+extr.sur.chd.med.meth3_d <- apply(def.sur.chd.meth3_d, 1, median)
+
+# Mean survival of BC
+xx_d <- c(fit.times_d, extr.times)
+fxx_d <- rbind(fit.sur_d, def.sur.chd.meth3_d)
+area_d <- matrix(NA, nrow = length(xx_d), ncol = ncol(fxx_d))
+for(i in 2:length(xx_d)){
+  for(j in 1:ncol(fxx_d)){
+    area_d[i, j] <- (xx_d[i] - xx_d[i-1])*(fxx_d[i-1, j] + fxx_d[i, j])/2
+  }
+}
+t.area_d.meth3 <- apply(area_d[-1, ], 2, sum)
+mean(t.area_d.meth3)
+
+# Life years gained
+lyg.meth3 <- t.area_pop - t.area_d.meth3
+
+
+## Method 4: Assume a constant ratio h_pop/h_d ##
+
+
+chr <- function(y, x1 = fit.times_d){
+  chr <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chr)
+}
+chr.fitted_d <- apply(fit.haz_pop / fit.haz_d, 2, chr)
+
+del.lag <- 1
+del <- seq(last.fit.time+1, nrow(tfit.haz_pop), by = del.lag)
+extr.haz.del_pop <- tfit.haz_pop[del, ]
+
+# Extrapolate
+mat.chr.del.fitted_d <- matrix(rep(chr.fitted_d, nrow(extr.haz.del_pop)), nrow(extr.haz.del_pop), ncol(extr.haz.del_pop), byrow = TRUE)
+
+extr.chr.del_d_q3 <- apply(extr.haz.del_pop / mat.chr.del.fitted_d, 1, q3)
+extr.chr.del_d_q4 <- apply(extr.haz.del_pop / mat.chr.del.fitted_d, 1, q4)
+extr.chr.del_d_med <- apply(extr.haz.del_pop / mat.chr.del.fitted_d, 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_d <- rbind(fit.cumhaz_d, matrix(0, nrow = nrow(extr.haz.del_pop), ncol = ncol(extr.haz.del_pop)))
+for(i in 1:nrow(extr.haz.del_pop)){
+  textr.cumhaz_d[i+nrow(fit.cumhaz_d), ] <- textr.cumhaz_d[i+nrow(fit.cumhaz_d)-1, ] +
+    {extr.haz.del_pop / mat.chr.del.fitted_d}[i, ]
+}
+def.sur.chr.meth4_d <- exp(-textr.cumhaz_d)[(last.fit.time+1):nrow(textr.cumhaz_d), ]
+
+extr.sur.chr.q3.meth4_d <- apply(def.sur.chr.meth4_d, 1, q3)
+extr.sur.chr.q4.meth4_d <- apply(def.sur.chr.meth4_d, 1, q4)
+extr.sur.chr.med.meth4_d <- apply(def.sur.chr.meth4_d, 1, median)
+
+# Mean survival of BC
+xx_d <- c(fit.times_d, extr.times)
+fxx_d <- rbind(fit.sur_d, def.sur.chr.meth4_d)
+area_d <- matrix(NA, nrow = length(xx_d), ncol = ncol(fxx_d))
+for(i in 2:length(xx_d)){
+  for(j in 1:ncol(fxx_d)){
+    area_d[i, j] <- (xx_d[i] - xx_d[i-1])*(fxx_d[i-1, j] + fxx_d[i, j])/2
+  }
+}
+t.area_d.meth4 <- apply(area_d[-1, ], 2, sum)
+mean(t.area_d.meth4)
+
+# Life years gained
+lyg.meth4 <- t.area_pop - t.area_d.meth4
+
+
+## Method 5: Assume a constant ratio h1_pop / h1_d ##
+
+
+chr <- function(y, x1 = fit.times_d){
+  chr <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chr)
+}
+chr.fitted1_d <- apply(fit.hazard_pop[1:last.fit.time, , 1] / fit.hazard_d[, , 1], 2, chr)
+
+del.lag <- 1
+del <- seq(last.fit.time+1, nrow(tfit.haz_pop), by = del.lag)
+extr1.haz.del_pop <- fit.hazard_pop[del, , 1]
+
+# Extrapolate
+mat.chr.del.fitted1_d <- matrix(rep(chr.fitted1_d, nrow(extr1.haz.del_pop)), nrow(extr1.haz.del_pop), ncol(extr1.haz.del_pop), byrow = TRUE)
+
+haz1_d <- extr1.haz.del_pop / mat.chr.del.fitted1_d
+
+extr.chr.del1_d_q3 <- apply(haz1_d + extr.hazard_d[, , 2], 1, q3)
+extr.chr.del1_d_q4 <- apply(haz1_d + extr.hazard_d[, , 2], 1, q4)
+extr.chr.del1_d_med <- apply(haz1_d + extr.hazard_d[, , 2], 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_d <- rbind(fit.cumhaz_d, matrix(0, nrow = nrow(extr1.haz.del_pop), ncol = ncol(extr1.haz.del_pop)))
+for(i in 1:nrow(extr1.haz.del_pop)){
+  textr.cumhaz_d[i+nrow(fit.cumhaz_d), ] <- textr.cumhaz_d[i+nrow(fit.cumhaz_d)-1, ] +
+    {extr1.haz.del_pop / mat.chr.del.fitted1_d + extr.hazard_d[, , 2]}[i, ]
+}
+def.sur.chr.meth5_d <- exp(-textr.cumhaz_d)[(last.fit.time+1):nrow(textr.cumhaz_d), ]
+
+extr.sur.chr.q3.meth5_d <- apply(def.sur.chr.meth5_d, 1, q3)
+extr.sur.chr.q4.meth5_d <- apply(def.sur.chr.meth5_d, 1, q4)
+extr.sur.chr.med.meth5_d <- apply(def.sur.chr.meth5_d, 1, median)
+
+# Mean survival of BC
+xx_d <- c(fit.times_d, extr.times)
+fxx_d <- rbind(fit.sur_d, def.sur.chr.meth5_d)
+area_d <- matrix(NA, nrow = length(xx_d), ncol = ncol(fxx_d))
+for(i in 2:length(xx_d)){
+  for(j in 1:ncol(fxx_d)){
+    area_d[i, j] <- (xx_d[i] - xx_d[i-1])*(fxx_d[i-1, j] + fxx_d[i, j])/2
+  }
+}
+t.area_d.meth5 <- apply(area_d[-1, ], 2, sum)
+mean(t.area_d.meth5)
+
+# Life years gained
+lyg.meth5 <- t.area_pop - t.area_d.meth5
+
+
+## Results ##
+
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_d,
+                              y = fit.haz.d.med,
+                              z = "BC"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = emp.haz_d.times,
+                              y = emp.haz_d,
+                              z = "emp_BC"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = c(fit.times_d, extr.times),
+                              y = c(fit.haz.pop.med, extr.haz.pop.med),
+                              z = "external"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = extr.times,
+                              y = extr.haz.d.med,
+                              z = "BC",
+                              g = "mod, ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.chd.del_d_med,
+                              z = "BC",
+                              g = "diff, diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.chd.del1_d_med,
+                              z = "BC",
+                              g = "diff, diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.chr.del_d_med,
+                              z = "BC",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.chr.del1_d_med,
+                              z = "BC",
+                              g = "mod, ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  scale_linetype_manual(values = c("solid", "dotted", "dashed"),
+                        name = NULL,
+                        breaks = c("BC", "external", "emp_BC"),
+                        labels = c("BC", "external", "emp_BC")) +
+  scale_color_manual(values = c("red2", "blue", "seagreen"),
+                     name = NULL,
+                     breaks = c("mod, ratio.cs", "diff, diff.cs", "ratio"),
+                     labels = c("mod, ratio.cs", "diff, diff.cs", "ratio")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 0.03, by = 0.005)) +
+  coord_cartesian(ylim = c(0, 0.03), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("bc_extr_haz_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Survival function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_d,
+                              y = fit.sur.d.med,
+                              z = "BC"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_step(data = data.frame(x = km.fit_d$time,
+                              y = km.fit_d$surv,
+                              z = "KM_BC"),
+            aes(x = x, y = y, linetype = z), direction = "hv") +
+  geom_line(data = data.frame(x = c(fit.times_d, extr.times),
+                              y = c(fit.sur.pop.med, extr.sur.pop.med),
+                              z = "external"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = extr.times,
+                              y = extr.sur.d.med,
+                              z = "BC",
+                              g = "mod, ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.sur.chd.med.meth2_d,
+                              z = "BC",
+                              g = "diff, diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.sur.chd.med.meth3_d,
+                              z = "BC",
+                              g = "diff, diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.sur.chr.med.meth4_d,
+                              z = "BC",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time:(last.fit.time+length(del)-1),
+                              y = extr.sur.chr.med.meth5_d,
+                              z = "BC",
+                              g = "mod, ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  scale_linetype_manual(values = c("solid", "dotted", "dashed"),
+                        name = NULL,
+                        breaks = c("BC", "external", "emp_BC"),
+                        labels = c("BC", "external", "emp_BC")) +
+  scale_color_manual(values = c("red2", "blue", "seagreen"),
+                     name = NULL,
+                     breaks = c("mod, ratio.cs", "diff, diff.cs", "ratio"),
+                     labels = c("mod, ratio.cs", "diff, diff.cs", "ratio")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("bc_extr_surv_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Life years gained
+ggplot() +
+  stat_density(data = data.frame(x = lyg,
+                                 y = rep("mod, ratio.cs", each = length(lyg))),
+               aes(x = x, color = y), geom = "line", position = "identity") +
+  stat_density(data = data.frame(x = lyg.meth2,
+                                 y = rep("diff, diff.cs", each = length(lyg.meth2))),
+               aes(x = x, color = y), geom = "line", position = "identity") +
+  stat_density(data = data.frame(x = lyg.meth4,
+                                 y = rep("ratio", each = length(lyg.meth4))),
+               aes(x = x, color = y), geom = "line", position = "identity") +
+  scale_color_manual(values = c("red2", "blue", "seagreen"),
+                     name = NULL,
+                     breaks = c("mod, ratio.cs", "diff, diff.cs", "ratio"),
+                     labels = c("mod, ratio.cs", "diff, diff.cs", "ratio")) +
+  scale_x_continuous(breaks = seq(100, 245, by = 5)) +
+  theme_bw() +
+  labs(x = "Time (months)",
+       y = "density",
+       title = "Life Years Gained") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title.x = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("bc_lyg.dens_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+

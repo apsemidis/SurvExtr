@@ -1,0 +1,500 @@
+
+#############################################################
+#----- jBiWeibull; prop 1st comp; same 2nd comp; fi0.8 -----#
+#############################################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Nice plots
+library(ggplot2)
+
+# Kaplan-Meier and empirical hazard estimate
+library(survival)
+library(muhaz)
+
+# Gauss-Kronrod quadrature
+library(pracma)
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+## Functions ##
+
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+# Functions for the hazard and log-survival function of a Weibull distribution
+# 
+# x     : time of event or censoring
+# shape : shape parameter of the distribution
+# rate  : rate parameter of the distribution (actually it is a mix of rate and scale)
+# 
+h_weib <- function(x, shape, rate){
+  h <- rate * shape * x^(shape - 1)
+  
+  return(h)
+}
+logS_weib <- function(x, shape, rate){
+  logS <- - rate * x^shape
+  
+  return(logS)
+}
+
+
+#####
+# Data
+
+
+# The whole dataset (downloaded from cBioPortal)
+dat <- read.csv("brca_metabric_clinical_data.txt", header = TRUE, sep = "\t")
+unique(dat$Sex) # only females
+
+# Keep only time, status and age
+dat_d <- data.frame(matrix(NA, nrow(dat), 3)); colnames(dat_d) <- c("time", "status", "age")
+
+dat_d[, 1] <- dat$Overall.Survival..Months.
+dat_d[, 2] <- dat$Overall.Survival.Status # 0=censor , 1=event (death)
+dat_d[, 3] <- dat$Age.at.Diagnosis
+str(dat_d)
+
+# Some rows are NA's for both time and status
+tfna <- apply(dat_d, 2, is.na)
+all(which(tfna[, 1] == TRUE) == which(tfna[, 2] == TRUE))
+
+# Remove NA's
+dat_d <- dat_d[c(!tfna[, 1]), ]
+
+# Make status numeric
+for(i in 1:nrow(dat_d)){
+  if(dat_d$status[i] == "0:LIVING"){
+    dat_d$status[i] <- 0
+  } else {
+    dat_d$status[i] <- 1
+  }
+}
+dat_d$status <- as.numeric(dat_d$status)
+
+# It has event time = 0
+dat_d <- dat_d[-186, ]
+dat_d <- dat_d[order(dat_d$time), ]
+rownames(dat_d) <- 1:nrow(dat_d)
+
+# Ages in the study
+dat_d$age <- floor(dat_d$age)
+
+
+## External population ##
+
+
+# Load the next year survival matrix
+source("surv_f.R")
+
+# Proportions for every age
+props <- table(dat_d$age) / sum(table(dat_d$age))
+
+# Keep only the ages of the dataset
+surv <- surv_f[, 1+sort(unique(dat_d$age))]
+
+# Weighted average of next year survival
+weighted.mean <- function(x){
+  sum(x*props, na.rm = TRUE)/sum(props)
+}
+w.surv <- apply(surv, 1, weighted.mean)
+
+# Generate times to event
+set.seed(123456)
+Npop <- 5e3
+atrisk <- numeric(length(w.surv))
+sumev <- numeric(length(w.surv))
+atrisk[1] <- Npop
+sumev[1] <- round(atrisk[1] - w.surv[1]*atrisk[1])
+for(i in 2:length(w.surv)){
+  atrisk[i] <- atrisk[i-1] - sumev[i-1]
+  sumev[i] <- round((w.surv[i-1]*atrisk[i] - w.surv[i]*atrisk[i]) / w.surv[i-1]) # number of events at each time
+}
+atrisk[which(is.nan(atrisk))] <- 0
+sumev[which(is.nan(sumev))] <- 0
+timetoev <- NULL
+for(i in 1:length(sumev)){
+  times.ext <- runif(sumev[i], (i-1)*12, i*12) # convert annual events to monthly events
+  timetoev <- c(timetoev, sort(times.ext)) # times to event for the external population
+}
+
+
+#####
+# Non-parametrics
+
+
+# KM, NA and empirical hazard for the diseaase population
+km.fit_d <- survfit(Surv(time, status) ~ 1, data = dat_d)
+naest_d <- cumsum(km.fit_d$n.event/km.fit_d$n.risk)
+emp.haz_d <- muhaz(dat_d$time, dat_d$status)$haz.est # max time is 355.2 months (307.63 is used)
+emp.haz_d.times <- muhaz(dat_d$time, dat_d$status)$est.grid
+
+# KM, NA and empirical hazard for the external population
+dat_pop <- data.frame(time = timetoev,
+                      status = 1)
+km.fit_pop <- survfit(Surv(time, status) ~ 1, data = dat_pop)
+naest_pop <- cumsum(km.fit_pop$n.event/km.fit_pop$n.risk)
+emp.haz_pop <- muhaz(dat_pop$time, dat_pop$status)$haz.est # max time is 999.769 months (818.88 is used)
+emp.haz_pop.times <- muhaz(dat_pop$time, dat_pop$status)$est.grid
+
+# KM, NA and empirical hazard for the new disease population
+last.time_f0.8 <- min(eve.dat$time[frac.info > 0.8])
+last.pers_f0.8 <- max(which(dat_d$time == last.time_f0.8))
+dat_d1 <- dat_d
+for(i in 1:nrow(dat_d1)){
+  if(dat_d1$time[i] > last.time_f0.8){
+    dat_d1$time[i] <- dat_d$time[last.pers_f0.8]
+    dat_d1$status[i] <- 0
+  }
+}
+km.fit1_d <- survfit(Surv(time, status) ~ 1, data = dat_d1) # KM for the new disease population
+naest1_d <- cumsum(km.fit1_d$n.event/km.fit1_d$n.risk) # NA for the new disease population
+emp.haz1_d <- muhaz(dat_d1$time, dat_d1$status, max.time = dat_d1$time[which(dat_d$time == last.time_f0.8)])$haz.est
+emp.haz1_d.times <- muhaz(dat_d1$time, dat_d1$status, max.time = dat_d1$time[which(dat_d$time == last.time_f0.8)])$est.grid
+
+
+#####
+# Stan models
+
+
+# Joint Bi-Weibull; prop 1st comp; same 2nd comp
+mod <- "
+functions {
+  real h_weib(real t, real shape, real rate) {
+    real h;
+    
+    h = rate * shape * pow(t, shape - 1);
+    return h;
+  }
+  real logS_weib(real t, real shape, real rate) {
+    real logS;
+  	
+    logS = - rate * pow(t, shape);
+    return logS;
+  }
+}
+
+data {
+  int<lower=0> N_d;                       // number of individuals in disease group
+  int<lower=0> N_pop;                     // number of individuals in external population
+  real<lower=0> times_d[N_d];             // times to event or censoring for disease
+  real<lower=0> times_pop[N_pop];         // times to event for external population
+  real<lower=0,upper=1> event_d[N_d];     // 1=event, 0=censor (for disease)
+  real<lower=0,upper=1> event_pop[N_pop]; // 1=event, 0=censor (for external population)
+}
+
+parameters {
+  positive_ordered[2] alpha_pop;          // shape parameters for the external population
+  vector<lower=0>[2] lambda_pop;          // rate parameters for the external population
+  real<lower=0> C;                        // h_d / h_pop (for the 1st component)
+}
+
+transformed parameters {
+  vector[2] h_pop;
+  vector[2] h_d;
+  vector[2] logS_pop;
+  vector[2] logS_d;
+  vector[N_pop] loglik_pop;
+  vector[N_d] loglik_d;
+  
+  // External population
+  for(i in 1:N_pop){
+    h_pop[1] = h_weib(times_pop[i], alpha_pop[1], lambda_pop[1]);
+    logS_pop[1] = logS_weib(times_pop[i], alpha_pop[1], lambda_pop[1]);
+    h_pop[2] = h_weib(times_pop[i], alpha_pop[2], lambda_pop[2]);
+    logS_pop[2] = logS_weib(times_pop[i], alpha_pop[2], lambda_pop[2]);
+    loglik_pop[i] = event_pop[i]*log(sum(h_pop)) + sum(logS_pop);
+  }
+  // Disease group
+  for(i in 1:N_d){
+    h_d[1] = C * h_weib(times_d[i], alpha_pop[1], lambda_pop[1]);
+    logS_d[1] = C * logS_weib(times_d[i], alpha_pop[1], lambda_pop[1]);
+    h_d[2] = h_weib(times_d[i], alpha_pop[2], lambda_pop[2]);
+    logS_d[2] = logS_weib(times_d[i], alpha_pop[2], lambda_pop[2]);
+    loglik_d[i] = event_d[i]*log(sum(h_d)) + sum(logS_d);
+  }
+}
+
+model {
+  for(i in 1:2){
+    target += exponential_lpdf(alpha_pop[i] | 0.1);
+    target += gamma_lpdf(lambda_pop[i] | 2, 0.5);        // mean = 2 / 0.5 (shape,rate)
+  }
+  target += exponential_lpdf(C | 0.1);
+
+  target += sum(loglik_d);
+  target += sum(loglik_pop);
+}
+"
+stan_mod <- stan_model(model_code = mod)
+
+
+#####
+# Modeling
+
+
+dat_d1 <- dat_d1[order(dat_d1$time), -3]; rownames(dat_d1) <- 1:nrow(dat_d1)
+
+# The stan data
+stan_data <- within(list(), {
+  N_d <- nrow(dat_d1)
+  N_pop <- nrow(dat_pop)
+  times_d <- dat_d1$time
+  times_pop <- dat_pop$time
+  event_d <- dat_d1$status
+  event_pop <- dat_pop$status})
+
+# Stan parameters
+stan_chains <- 3
+stan_warmup <- 500
+stan_iter <- 5e3 + stan_warmup
+stan_delta <- 0.98
+stan_tree <- 14
+stan_thin <- 1
+stan_seed <- 12345
+
+# Set initial values
+stan_init <- list(
+  list(alpha_pop = c(1, 2),
+       lambda_pop = c(0.1, 0.05),
+       C = 1.5),
+  list(alpha_pop = c(0.8, 1.5),
+       lambda_pop = c(0.01, 0.005),
+       C = 1),
+  list(alpha_pop = c(0.5, 0.9),
+       lambda_pop = c(0.005, 0.001),
+       C = 5))
+
+# Run NUTS
+time.start_nuts <- Sys.time()
+nuts_fit <- sampling(stan_mod,
+                     data = stan_data,
+                     iter = stan_iter,
+                     init = stan_init,
+                     chains = stan_chains,
+                     warmup = stan_warmup,
+                     thin = stan_thin,
+                     seed = stan_seed,
+                     control = list(adapt_delta = stan_delta,
+                                    max_treedepth = stan_tree))
+time.end_nuts <- Sys.time()
+duration_nuts <- time.end_nuts - time.start_nuts
+
+fit_summary <- summary(nuts_fit, pars = c("alpha_pop", "lambda_pop", "C"))$summary
+print(fit_summary, digits = 2)
+
+# Divergent transitions, exceeded treedepth
+check_divergences(nuts_fit)
+check_treedepth(nuts_fit)
+
+# Extract posterior samples
+post <- extract(nuts_fit,
+                pars = c("alpha_pop", "lambda_pop", "C"),
+                permuted = FALSE,
+                inc_warmup = TRUE,
+                include = TRUE)
+post_no_warm <- post[(stan_warmup+1):dim(post)[1], , ] # exclude the warmu-up period
+
+# Check the autoccorrelation
+apply(post_no_warm[, 1, ], 2, acf)
+acf(post_no_warm[, 1, c("alpha_pop[1]")]) # the first chain of the first parameter
+
+# Fix autocorrelation
+keep <- seq(1, stan_iter - stan_warmup, by = 5) # keep one every 5 samples
+post_noac <- post_no_warm[keep, , ]
+acf(post_noac[, 1, c("alpha_pop[1]")]) # the first chain of the first parameter
+
+# saveRDS(nuts_fit, "jBiWeib_prop_1st_comp_same_2nd_comp.rds") # save the results
+# nuts_fit <- readRDS("jBiWeib_prop_1st_comp_same_2nd_comp.rds") # load the objects into R
+
+
+## Compute the log-likelihood ##
+
+
+# Estimated parameters
+alphas_pop <- rbind(post_noac[, 1, c("alpha_pop[1]", "alpha_pop[2]")],
+                    post_noac[, 2, c("alpha_pop[1]", "alpha_pop[2]")],
+                    post_noac[, 3, c("alpha_pop[1]", "alpha_pop[2]")]) # shapes
+lambdas_pop <- rbind(post_noac[, 1, c("lambda_pop[1]", "lambda_pop[2]")],
+                     post_noac[, 2, c("lambda_pop[1]", "lambda_pop[2]")],
+                     post_noac[, 3, c("lambda_pop[1]", "lambda_pop[2]")]) # rates
+hr <- c(post_noac[, 1, "C"],
+        post_noac[, 2, "C"],
+        post_noac[, 3, "C"]) # hazard ratio for the 1st component
+
+# Mean values of the estimated parameters
+alphas_pop_mean <- apply(alphas_pop, 2, mean)
+lambdas_pop_mean <- apply(lambdas_pop, 2, mean)
+hr_mean <- mean(hr)
+
+# Disease
+h_d <- logS_d <- array(NA, dim = c(nrow(dat_d1), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:nrow(dat_d1)){
+  for(j in 1:nrow(lambdas_pop)){
+    h_d[i, j, 1] <- hr[j] * h_weib(dat_d1$time[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    logS_d[i, j, 1] <- hr[j] * logS_weib(dat_d1$time[i], alphas_pop[j, 1], lambdas_pop[j, 1])
+    h_d[i, j, 2] <- h_weib(dat_d1$time[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+    logS_d[i, j, 2] <- logS_weib(dat_d1$time[i], alphas_pop[j, 2], lambdas_pop[j, 2])
+  }
+}
+total_hazard_d <- apply(h_d, c(1, 2), sum)
+total_lsurvival_d <- apply(logS_d, c(1, 2), sum)
+
+# External population
+h_pop <- logS_pop <- array(NA, dim = c(nrow(dat_pop), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:nrow(dat_pop)){
+  for(j in 1:nrow(lambdas_pop)){
+    for(k in 1:ncol(lambdas_pop)){
+      h_pop[i, j, k] <- h_weib(dat_pop$time[i], alphas_pop[j, k], lambdas_pop[j, k])
+      logS_pop[i, j, k] <- logS_weib(dat_pop$time[i], alphas_pop[j, k], lambdas_pop[j, k])
+    }
+  }
+}
+total_hazard_pop <- apply(h_pop, c(1, 2), sum)
+total_lsurvival_pop <- apply(logS_pop, c(1, 2), sum)
+
+
+#####
+# Results
+
+
+# Form the survival and hazard
+haz_d <- total_hazard_d
+haz_d1 <- h_d[, , 1]
+haz_d2 <- h_d[, , 2]
+sur_d <- exp(total_lsurvival_d)
+haz_pop <- total_hazard_pop
+haz_pop1 <- h_pop[, , 1]
+haz_pop2 <- h_pop[, , 2]
+sur_pop <- exp(total_lsurvival_pop)
+
+# Create summary statistics
+sur.d.q3 <- apply(sur_d, 1, q3)
+sur.d.q4 <- apply(sur_d, 1, q4)
+sur.d.med <- apply(sur_d, 1, median)
+haz.d.q3 <- apply(haz_d, 1, q3)
+haz.d.q4 <- apply(haz_d, 1, q4)
+haz.d.med <- apply(haz_d, 1, median)
+haz.d.med.c1 <- apply(haz_d1, 1, median)
+haz.d.med.c2 <- apply(haz_d2, 1, median)
+sur.pop.q3 <- apply(sur_pop, 1, q3)
+sur.pop.q4 <- apply(sur_pop, 1, q4)
+sur.pop.med <- apply(sur_pop, 1, median)
+haz.pop.q3 <- apply(haz_pop, 1, q3)
+haz.pop.q4 <- apply(haz_pop, 1, q4)
+haz.pop.med <- apply(haz_pop, 1, median)
+haz.pop.med.c1 <- apply(haz_pop1, 1, median)
+haz.pop.med.c2 <- apply(haz_pop2, 1, median)
+
+# # Save
+# save.list <- list(sur.d.q3 = sur.d.q3, sur.d.q4 = sur.d.q4, sur.d.med = sur.d.med,
+#                   haz.d.q3 = haz.d.q3, haz.d.q4 = haz.d.q4, haz.d.med = haz.d.med,
+#                   haz.d.med.c1 = haz.d.med.c1, haz.d.med.c2 = haz.d.med.c2,
+#                   sur.pop.q3 = sur.pop.q3, sur.pop.q4 = sur.pop.q4, sur.pop.med = sur.pop.med,
+#                   haz.pop.q3 = haz.pop.q3, haz.pop.q4 = haz.pop.q4, haz.pop.med = haz.pop.med,
+#                   haz.pop.med.c1 = haz.pop.med.c1, haz.pop.med.c2 = haz.pop.med.c2)
+# dump("save.list", "jBiWeib_prop_1st_comp_same_2nd_comp.R")
+
+# Survival function
+ggplot() +
+  geom_line(data = data.frame(x = dat_d1$time,
+                              y = sur.d.med,
+                              z = "follow_up",
+                              l = "follow_up"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = sur.pop.med,
+                              z = "external",
+                              l = "external"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_step(data = data.frame(x = km.fit1_d$time,
+                              y = km.fit1_d$surv,
+                              z = "KM_follow_up",
+                              l = "KM_follow_up"),
+            aes(x = x, y = y, color = z, linetype = l), direction = "hv") +
+  scale_color_manual(values = c("dodgerblue", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("follow_up", "external", "KM_follow_up"),
+                     labels = c("follow_up", "external", "KM_follow_up")) +
+  scale_linetype_manual(values = c("dashed", "dotted", "solid"),
+                        name = NULL,
+                        breaks = c("follow_up", "external", "KM_follow_up"),
+                        labels = c("follow_up", "external", "KM_follow_up")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 164, by = 20)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(xlim = c(0, 164), ylim = c(0, 1)) +
+  labs(x = "Time (months)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("surv_fun_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = dat_d1$time,
+                              y = haz.d.med,
+                              z = "follow_up",
+                              l = "follow_up"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = emp.haz1_d.times,
+                              y = emp.haz1_d,
+                              z = "emp_follow_up",
+                              l = "emp_follow_up"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med,
+                              z = "external",
+                              l = "external"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  scale_color_manual(values = c("dodgerblue", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("follow_up", "external", "emp_follow_up"),
+                     labels = c("follow_up", "external", "emp_follow_up")) +
+  scale_linetype_manual(values = c("dashed", "dotted", "solid"),
+                        name = NULL,
+                        breaks = c("follow_up", "external", "emp_follow_up"),
+                        labels = c("follow_up", "external", "emp_follow_up")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 164, by = 1e2)) +
+  scale_y_continuous(breaks = seq(0, 0.008, by = 0.001)) +
+  coord_cartesian(xlim = c(0, 164), ylim = c(0, 0.008)) +
+  labs(x = "Time (months)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("haz_fun_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+

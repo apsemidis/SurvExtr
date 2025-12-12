@@ -1,0 +1,757 @@
+
+#####################################
+#----- jTriLLogi; same 3rd comp-----#
+#####################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Nice plots
+library(ggplot2)
+
+# Kaplan-Meier and empirical hazard estimate
+library(survival)
+library(muhaz)
+
+# Gauss-Kronrod quadrature
+library(pracma)
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+## Functions ##
+
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+# Functions for the hazard and log-survival function of a LogLogistic distribution
+# 
+# x     : time of event or censoring
+# shape : shape parameter of the distribution
+# scale : scale parameter of the distribution
+# 
+h_llogi <- function(x, shape, scale){
+  h <- (shape/scale) * (x/scale)^(shape-1) / (1+(x/scale)^shape)
+  
+  return(h)
+}
+logS_llogi <- function(x, shape, scale){
+  logS <- -log(1 + (x/scale)^shape)
+  
+  return(logS)
+}
+
+
+#####
+# Data
+
+
+# The whole dataset (downloaded from cBioPortal)
+dat <- read.csv("brca_metabric_clinical_data.txt", header = TRUE, sep = "\t")
+dat <- dat[, c("Overall.Survival..Months.", "Overall.Survival.Status", "Age.at.Diagnosis",
+               "ER.Status", "HER2.Status", "PR.Status")]
+colnames(dat) <- c("time", "status", "age", "ER.Status", "HER2.Status", "PR.Status")
+
+# Convert to factors
+dat$ER.Status <- factor(dat$ER.Status)
+dat$HER2.Status <- factor(dat$HER2.Status)
+dat$PR.Status <- factor(dat$PR.Status)
+
+# Detect NA's
+tfna <- apply(dat, 2, is.na)
+apply(tfna, 2, sum)
+summary(dat)
+
+# Remove NA's from PR status (it removes all other NA's too)
+dat <- dat[-which(is.na(dat$PR.Status)), ]
+summary(dat)
+str(dat)
+
+# Make status numeric
+for(i in 1:nrow(dat)){
+  if(dat$status[i] == "0:LIVING"){
+    dat$status[i] <- 0
+  } else {
+    dat$status[i] <- 1
+  }
+}
+dat$status <- as.numeric(dat$status)
+
+# It has event time = 0
+dat <- dat[-186, ]
+dat <- dat[order(dat$time), ]
+rownames(dat) <- 1:nrow(dat)
+
+# Ages in the study
+dat$age <- floor(dat$age)
+
+# ER, HER2 and PR status
+ftable(dat$ER.Status, dat$HER2.Status, dat$PR.Status) # 1st column = ER, 2nd column = HER2, 3rd column = PR
+
+# Make the covariate
+dat$X <- numeric(nrow(dat))
+for(i in 1:nrow(dat)){
+  if(dat$ER.Status[i] == "Negative" & dat$HER2.Status[i] =="Negative" & dat$PR.Status[i] == "Negative"){
+    dat$X[i] <- 1
+  }
+}
+
+
+## External population ##
+
+
+# Load the next year survival matrix
+source("surv_f.R")
+
+# Proportions for every age
+props <- table(dat$age) / sum(table(dat$age))
+
+# Keep only the ages of the dataset
+surv <- surv_f[, 1+sort(unique(dat$age))]
+
+# Weighted average of next year survival
+weighted.mean <- function(x){
+  sum(x*props, na.rm = TRUE)/sum(props)
+}
+w.surv <- apply(surv, 1, weighted.mean)
+
+# Generate times to event
+set.seed(123456)
+Npop <- 5e3
+atrisk <- numeric(length(w.surv))
+sumev <- numeric(length(w.surv))
+atrisk[1] <- Npop
+sumev[1] <- round(atrisk[1] - w.surv[1]*atrisk[1])
+for(i in 2:length(w.surv)){
+  atrisk[i] <- atrisk[i-1] - sumev[i-1]
+  sumev[i] <- round((w.surv[i-1]*atrisk[i] - w.surv[i]*atrisk[i]) / w.surv[i-1]) # number of events at each time
+}
+atrisk[which(is.nan(atrisk))] <- 0
+sumev[which(is.nan(sumev))] <- 0
+timetoev <- NULL
+for(i in 1:length(sumev)){
+  times.ext <- runif(sumev[i], (i-1)*12, i*12) # convert annual events to monthly events
+  timetoev <- c(timetoev, sort(times.ext)) # times to event for the external population
+}
+
+
+#####
+# Non-parametrics
+
+
+# KM, NA and empirical hazard for the diseaase population (triple negative)
+dat_dn <- dat[which(dat$X == 1), c("time", "status")]
+km.fit_dn <- survfit(Surv(time, status) ~ 1, data = dat_dn)
+naest_dn <- cumsum(km.fit_dn$n.event/km.fit_dn$n.risk)
+emp.haz_dn <- muhaz(dat_dn$time, dat_dn$status)$haz.est # max time is 307.9333 months (267.4 is used)
+emp.haz_dn.times <- muhaz(dat_dn$time, dat_dn$status)$est.grid
+
+# KM, NA and empirical hazard for the diseaase population (not triple negative)
+dat_dp <- dat[which(dat$X == 0), c("time", "status")]
+km.fit_dp <- survfit(Surv(time, status) ~ 1, data = dat_dp)
+naest_dp <- cumsum(km.fit_dp$n.event/km.fit_dp$n.risk)
+emp.haz_dp <- muhaz(dat_dp$time, dat_dp$status)$haz.est # max time is 355.2 months (301.23 is used)
+emp.haz_dp.times <- muhaz(dat_dp$time, dat_dp$status)$est.grid
+
+# KM, NA and empirical hazard for the external population
+dat_pop <- data.frame(time = timetoev,
+                      status = 1)
+km.fit_pop <- survfit(Surv(time, status) ~ 1, data = dat_pop)
+naest_pop <- cumsum(km.fit_pop$n.event/km.fit_pop$n.risk)
+emp.haz_pop <- muhaz(dat_pop$time, dat_pop$status)$haz.est # max time is 999.769 months (818.88 is used)
+emp.haz_pop.times <- muhaz(dat_pop$time, dat_pop$status)$est.grid
+
+
+#####
+# Stan models
+
+
+# Joint TriLogLogistic; same 3rd comp
+mod <- "
+functions {
+  real h_llogi(real t, real shape, real scale) {
+    real h;
+    
+    h = (shape/scale) * pow(t/scale,shape-1) / (1+pow(t/scale,shape));
+    return h;
+  }
+  real logS_llogi(real t, real shape, real scale) {
+    real logS;
+  	
+    logS = -log(1 + pow(t/scale, shape));
+    return logS;
+  }
+}
+
+data {
+  int<lower=0> N_dn;                      // number of individuals in 3N
+  int<lower=0> N_dp;                      // number of individuals in n3N
+  int<lower=0> N_pop;                     // number of individuals in external population
+  real<lower=0> times_dn[N_dn];           // times to event or censoring for 3N
+  real<lower=0> times_dp[N_dp];           // times to event or censoring for n3N
+  real<lower=0> times_pop[N_pop];         // times to event for external population
+  real<lower=0,upper=1> event_dn[N_dn];   // 1=event, 0=censor (for 3N)
+  real<lower=0,upper=1> event_dp[N_dp];   // 1=event, 0=censor (for n3N)
+  real<lower=0,upper=1> event_pop[N_pop]; // 1=event, 0=censor (for external population)
+}
+
+parameters {
+  positive_ordered[3] alpha_pop;          // shape parameters for the external
+  positive_ordered[2] alpha_dn12;         // 1st, 2nd shape parameters for 3N
+  positive_ordered[2] alpha_dp12;         // 1st, 2nd shape parameters for n3N
+  vector<lower=0>[3] sigma_pop;           // scale parameters for the external
+  vector<lower=0>[2] sigma_dn12;          // 1st, 2nd scale parameters for 3N
+  vector<lower=0>[2] sigma_dp12;          // 1st, 2nd scale parameters for n3N
+}
+
+transformed parameters{
+  vector[3] h_pop;
+  vector[3] h_dn;
+  vector[3] h_dp;
+  vector[3] logS_pop;
+  vector[3] logS_dn;
+  vector[3] logS_dp;
+  vector[N_pop] loglik_pop;
+  vector[N_dn] loglik_dn;
+  vector[N_dp] loglik_dp;
+  vector<lower=0>[3] alpha_dn_new;
+  vector<lower=0>[3] alpha_dp_new;
+  vector<lower=0>[3] sigma_dn_new;
+  vector<lower=0>[3] sigma_dp_new;
+  
+  alpha_dn_new[1] = alpha_dn12[1];
+  alpha_dn_new[2] = alpha_dn12[2];
+  alpha_dn_new[3] = alpha_pop[3];
+  sigma_dn_new[1] = sigma_dn12[1];
+  sigma_dn_new[2] = sigma_dn12[2];
+  sigma_dn_new[3] = sigma_pop[3];
+  
+  alpha_dp_new[1] = alpha_dp12[1];
+  alpha_dp_new[2] = alpha_dp12[2];
+  alpha_dp_new[3] = alpha_pop[3];
+  sigma_dp_new[1] = sigma_dp12[1];
+  sigma_dp_new[2] = sigma_dp12[2];
+  sigma_dp_new[3] = sigma_pop[3];
+  
+  // External population
+  for(i in 1:N_pop){
+    for(j in 1:3){
+      h_pop[j] = h_llogi(times_pop[i], alpha_pop[j], sigma_pop[j]);
+      logS_pop[j] = logS_llogi(times_pop[i], alpha_pop[j], sigma_pop[j]);
+    }
+    loglik_pop[i] = event_pop[i]*log(sum(h_pop)) + sum(logS_pop);
+  }
+  // 3N
+  for(i in 1:N_dn){
+    for(j in 1:3){
+      h_dn[j] = h_llogi(times_dn[i], alpha_dn_new[j], sigma_dn_new[j]);
+      logS_dn[j] = logS_llogi(times_dn[i], alpha_dn_new[j], sigma_dn_new[j]);
+    }
+    loglik_dn[i] = event_dn[i]*log(sum(h_dn)) + sum(logS_dn);
+  }
+  // n3N
+  for(i in 1:N_dp){
+    for(j in 1:3){
+      h_dp[j] = h_llogi(times_dp[i], alpha_dp_new[j], sigma_dp_new[j]);
+      logS_dp[j] = logS_llogi(times_dp[i], alpha_dp_new[j], sigma_dp_new[j]);
+    }
+    loglik_dp[i] = event_dp[i]*log(sum(h_dp)) + sum(logS_dp);
+  }
+}
+
+model {
+  for(i in 1:3){
+    target += exponential_lpdf(alpha_pop[i] | 0.1);
+    target += gamma_lpdf(sigma_pop[i] | 2, 0.1);        // mean = 2 / 0.1 (shape,rate)
+  }
+  target += exponential_lpdf(alpha_dn12[1] | 0.1);
+  target += exponential_lpdf(alpha_dn12[2] | 0.1);
+  target += exponential_lpdf(alpha_dp12[1] | 0.1);
+  target += exponential_lpdf(alpha_dp12[2] | 0.1);
+  target += gamma_lpdf(sigma_dn12[1] | 2, 0.1);         // mean = 2 / 0.1 (shape,rate)
+  target += gamma_lpdf(sigma_dn12[2] | 2, 0.1);         // mean = 2 / 0.1 (shape,rate)
+  target += gamma_lpdf(sigma_dp12[1] | 2, 0.1);         // mean = 2 / 0.1 (shape,rate)
+  target += gamma_lpdf(sigma_dp12[2] | 2, 0.1);         // mean = 2 / 0.1 (shape,rate)
+  
+  target += sum(loglik_pop);
+  target += sum(loglik_dn);
+  target += sum(loglik_dp);
+}
+"
+stan_mod <- stan_model(model_code = mod)
+
+
+#####
+# Modeling
+
+
+dat_dn <- dat_dn[order(dat_dn$time), ]; rownames(dat_dn) <- 1:nrow(dat_dn)
+dat_dp <- dat_dp[order(dat_dp$time), ]; rownames(dat_dp) <- 1:nrow(dat_dp)
+
+# The stan data
+stan_data <- within(list(), {
+  N_dn <- nrow(dat_dn)
+  N_dp <- nrow(dat_dp)
+  N_pop <- nrow(dat_pop)
+  times_dn <- dat_dn$time
+  times_dp <- dat_dp$time
+  times_pop <- dat_pop$time
+  event_dn <- dat_dn$status
+  event_dp <- dat_dp$status
+  event_pop <- dat_pop$status})
+
+# Stan parameters
+stan_chains <- 3
+stan_warmup <- 500
+stan_iter <- 5e3 + stan_warmup
+stan_delta <- 0.98
+stan_tree <- 14
+stan_thin <- 1
+stan_seed <- 12345
+
+# Set initial values
+stan_init <- list(
+  list(alpha_pop = c(0.5, 1, 2),
+       alpha_dp12 = c(0.5, 1),
+       alpha_dn12 = c(0.5, 1),
+       sigma_pop = c(15, 30, 45),
+       sigma_dp12 = c(15, 30),
+       sigma_dn12 = c(15, 30)),
+  list(alpha_pop = c(0.9, 1.9, 2.9),
+       alpha_dp12 = c(0.9, 1.9),
+       alpha_dn12 = c(0.9, 1.9),
+       sigma_pop = c(20, 40, 60),
+       sigma_dp12 = c(20, 40),
+       sigma_dn12 = c(20, 40)),
+  list(alpha_pop = c(0.1, 5, 10),
+       alpha_dp12 = c(0.1, 5),
+       alpha_dn12 = c(0.1, 5),
+       sigma_pop = c(2, 50, 80),
+       sigma_dp12 = c(2, 50),
+       sigma_dn12 = c(2, 50)))
+
+# Run NUTS
+time.start_nuts <- Sys.time()
+nuts_fit <- sampling(stan_mod,
+                     data = stan_data,
+                     iter = stan_iter,
+                     init = stan_init,
+                     chains = stan_chains,
+                     warmup = stan_warmup,
+                     thin = stan_thin,
+                     seed = stan_seed,
+                     control = list(adapt_delta = stan_delta,
+                                    max_treedepth = stan_tree))
+time.end_nuts <- Sys.time()
+duration_nuts <- time.end_nuts - time.start_nuts
+
+fit_summary <- summary(nuts_fit, pars = c("alpha_pop", "sigma_pop", "alpha_dn12", "sigma_dn12", "alpha_dp12", "sigma_dp12",
+                                          "alpha_dn_new", "sigma_dn_new", "alpha_dp_new", "sigma_dp_new"))$summary
+print(fit_summary, digits = 2)
+
+# Divergent transitions, exceeded treedepth
+check_divergences(nuts_fit)
+check_treedepth(nuts_fit)
+
+# Extract posterior samples
+post <- extract(nuts_fit,
+                pars = c("alpha_pop", "sigma_pop", "alpha_dn12", "sigma_dn12", "alpha_dp12", "sigma_dp12",
+                         "alpha_dn_new", "sigma_dn_new", "alpha_dp_new", "sigma_dp_new"),
+                permuted = FALSE,
+                inc_warmup = TRUE,
+                include = TRUE)
+post_no_warm <- post[(stan_warmup+1):dim(post)[1], , ] # exclude the warmu-up period
+
+# Check the autoccorrelation
+# apply(post_no_warm[, 1, ], 2, acf)
+acf(post_no_warm[, 1, c("alpha_pop[1]")]) # the first chain of the first parameter
+
+# Fix autocorrelation
+keep <- seq(1, stan_iter - stan_warmup, by = 5) # keep one every 5 samples
+post_noac <- post_no_warm[keep, , ]
+acf(post_noac[, 1, c("alpha_pop[1]")]) # the first chain of the first parameter
+
+# saveRDS(nuts_fit, "jTriLLogi_same_3rd_comp.rds") # save the results
+# nuts_fit <- readRDS("jTriLLogi_same_3rd_comp.rds") # load the objects into R
+
+
+## Compute the log-likelihood ##
+
+
+# Estimated parameters
+alphas_pop <- rbind(post_noac[, 1, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")],
+                    post_noac[, 2, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")],
+                    post_noac[, 3, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")]) # shapes
+alphas_dp <- rbind(post_noac[, 1, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")],
+                   post_noac[, 2, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")],
+                   post_noac[, 3, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")]) # shapes
+alphas_dn <- rbind(post_noac[, 1, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")],
+                   post_noac[, 2, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")],
+                   post_noac[, 3, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")]) # shapes
+sigmas_pop <- rbind(post_noac[, 1, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")],
+                    post_noac[, 2, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")],
+                    post_noac[, 3, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")]) # scales
+sigmas_dp <- rbind(post_noac[, 1, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")],
+                   post_noac[, 2, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")],
+                   post_noac[, 3, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")]) # scales
+sigmas_dn <- rbind(post_noac[, 1, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")],
+                   post_noac[, 2, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")],
+                   post_noac[, 3, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")]) # scales
+
+# Mean values of the estimated parameters
+alphas_pop_mean <- apply(alphas_pop, 2, mean)
+alphas_dp_mean <- apply(alphas_dp, 2, mean)
+alphas_dn_mean <- apply(alphas_dn, 2, mean)
+sigmas_pop_mean <- apply(sigmas_pop, 2, mean)
+sigmas_dp_mean <- apply(sigmas_dp, 2, mean)
+sigmas_dn_mean <- apply(sigmas_dn, 2, mean)
+
+# 3N
+h_dn <- logS_dn <- array(NA, dim = c(nrow(dat_dn), nrow(sigmas_dn), ncol(sigmas_dn)))
+for(i in 1:nrow(dat_dn)){
+  for(j in 1:nrow(sigmas_dn)){
+    for(k in 1:ncol(sigmas_dn)){
+      h_dn[i, j, k] <- h_llogi(dat_dn$time[i], alphas_dn[j, k], sigmas_dn[j, k])
+      logS_dn[i, j, k] <- logS_llogi(dat_dn$time[i], alphas_dn[j, k], sigmas_dn[j, k])
+    }
+  }
+}
+total_hazard_dn <- apply(h_dn, c(1, 2), sum)
+total_lsurvival_dn <- apply(logS_dn, c(1, 2), sum)
+
+# n3N
+h_dp <- logS_dp <- array(NA, dim = c(nrow(dat_dp), nrow(sigmas_dp), ncol(sigmas_dp)))
+for(i in 1:nrow(dat_dp)){
+  for(j in 1:nrow(sigmas_dp)){
+    for(k in 1:ncol(sigmas_dp)){
+      h_dp[i, j, k] <- h_llogi(dat_dp$time[i], alphas_dp[j, k], sigmas_dp[j, k])
+      logS_dp[i, j, k] <- logS_llogi(dat_dp$time[i], alphas_dp[j, k], sigmas_dp[j, k])
+    }
+  }
+}
+total_hazard_dp <- apply(h_dp, c(1, 2), sum)
+total_lsurvival_dp <- apply(logS_dp, c(1, 2), sum)
+
+# External population
+h_pop <- logS_pop <- array(NA, dim = c(nrow(dat_pop), nrow(sigmas_pop), ncol(sigmas_pop)))
+for(i in 1:nrow(dat_pop)){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      h_pop[i, j, k] <- h_llogi(dat_pop$time[i], alphas_pop[j, k], sigmas_pop[j, k])
+      logS_pop[i, j, k] <- logS_llogi(dat_pop$time[i], alphas_pop[j, k], sigmas_pop[j, k])
+    }
+  }
+}
+total_hazard_pop <- apply(h_pop, c(1, 2), sum)
+total_lsurvival_pop <- apply(logS_pop, c(1, 2), sum)
+
+
+#####
+# Results
+
+
+# Form the survival and hazard
+haz_dn <- total_hazard_dn
+haz_dn1 <- h_dn[, , 1]
+haz_dn2 <- h_dn[, , 2]
+haz_dn3 <- h_dn[, , 3]
+sur_dn <- exp(total_lsurvival_dn)
+haz_dp <- total_hazard_dp
+haz_dp1 <- h_dp[, , 1]
+haz_dp2 <- h_dp[, , 2]
+haz_dp3 <- h_dp[, , 3]
+sur_dp <- exp(total_lsurvival_dp)
+haz_pop <- total_hazard_pop
+haz_pop1 <- h_pop[, , 1]
+haz_pop2 <- h_pop[, , 2]
+haz_pop3 <- h_pop[, , 3]
+sur_pop <- exp(total_lsurvival_pop)
+
+# Create summary statistics
+sur.bcn.q3 <- apply(sur_dn, 1, q3)
+sur.bcn.q4 <- apply(sur_dn, 1, q4)
+sur.bcn.med <- apply(sur_dn, 1, median)
+haz.bcn.q3 <- apply(haz_dn, 1, q3)
+haz.bcn.q4 <- apply(haz_dn, 1, q4)
+haz.bcn.med <- apply(haz_dn, 1, median)
+haz.bcn.med.c1 <- apply(haz_dn1, 1, median)
+haz.bcn.med.c2 <- apply(haz_dn2, 1, median)
+haz.bcn.med.c3 <- apply(haz_dn3, 1, median)
+sur.bcp.q3 <- apply(sur_dp, 1, q3)
+sur.bcp.q4 <- apply(sur_dp, 1, q4)
+sur.bcp.med <- apply(sur_dp, 1, median)
+haz.bcp.q3 <- apply(haz_dp, 1, q3)
+haz.bcp.q4 <- apply(haz_dp, 1, q4)
+haz.bcp.med <- apply(haz_dp, 1, median)
+haz.bcp.med.c1 <- apply(haz_dp1, 1, median)
+haz.bcp.med.c2 <- apply(haz_dp2, 1, median)
+haz.bcp.med.c3 <- apply(haz_dp3, 1, median)
+sur.pop.q3 <- apply(sur_pop, 1, q3)
+sur.pop.q4 <- apply(sur_pop, 1, q4)
+sur.pop.med <- apply(sur_pop, 1, median)
+haz.pop.q3 <- apply(haz_pop, 1, q3)
+haz.pop.q4 <- apply(haz_pop, 1, q4)
+haz.pop.med <- apply(haz_pop, 1, median)
+haz.pop.med.c1 <- apply(haz_pop1, 1, median)
+haz.pop.med.c2 <- apply(haz_pop2, 1, median)
+haz.pop.med.c3 <- apply(haz_pop3, 1, median)
+
+# # Save
+# save.list <- list(sur.bcn.q3 = sur.bcn.q3, sur.bcn.q4 = sur.bcn.q4, sur.bcn.med = sur.bcn.med,
+#                   haz.bcn.q3 = haz.bcn.q3, haz.bcn.q4 = haz.bcn.q4, haz.bcn.med = haz.bcn.med,
+#                   haz.bcn.med.c1 = haz.bcn.med.c1, haz.bcn.med.c2 = haz.bcn.med.c2, haz.bcn.med.c3 = haz.bcn.med.c3,
+#                   sur.bcp.q3 = sur.bcp.q3, sur.bcp.q4 = sur.bcp.q4, sur.bcp.med = sur.bcp.med,
+#                   haz.bcp.q3 = haz.bcp.q3, haz.bcp.q4 = haz.bcp.q4, haz.bcp.med = haz.bcp.med,
+#                   haz.bcp.med.c1 = haz.bcp.med.c1, haz.bcp.med.c2 = haz.bcp.med.c2, haz.bcp.med.c3 = haz.bcp.med.c3,
+#                   sur.pop.q3 = sur.pop.q3, sur.pop.q4 = sur.pop.q4, sur.pop.med = sur.pop.med,
+#                   haz.pop.q3 = haz.pop.q3, haz.pop.q4 = haz.pop.q4, haz.pop.med = haz.pop.med,
+#                   haz.pop.med.c1 = haz.pop.med.c1, haz.pop.med.c2 = haz.pop.med.c2, haz.pop.med.c3 = haz.pop.med.c3)
+# # dump("save.list", "jTriLLogi_same_3rd_comp.R")
+
+# Survival function
+ggplot() +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = sur.bcn.med,
+                              z = "3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = sur.bcp.med,
+                              z = "n3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = sur.pop.med,
+                              z = "external"),
+            aes(x = x, y = y, color = z)) +
+  geom_step(data = data.frame(x = km.fit_dn$time,
+                              y = km.fit_dn$surv,
+                              z = "KM_3N"),
+            aes(x = x, y = y, color = z), direction = "hv") +
+  geom_step(data = data.frame(x = km.fit_dp$time,
+                              y = km.fit_dp$surv,
+                              z = "KM_n3N"),
+            aes(x = x, y = y, color = z), direction = "hv") +
+  geom_step(data = data.frame(x = km.fit_pop$time,
+                              y = km.fit_pop$surv,
+                              z = "KM_external"),
+            aes(x = x, y = y, color = z), direction = "hv") +
+  geom_ribbon(data = data.frame(x = dat_dn$time,
+                                low = sur.bcn.q3,
+                                high = sur.bcn.q4,
+                                z = "95% 3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = dat_dp$time,
+                                low = sur.bcp.q3,
+                                high = sur.bcp.q4,
+                                z = "95% n3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = timetoev,
+                                low = sur.pop.q3,
+                                high = sur.pop.q4,
+                                z = "95% external"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = km.fit_dn$time,
+                                low = km.fit_dn$lower,
+                                high = km.fit_dn$upper,
+                                z = "95% KM_3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = km.fit_dp$time,
+                                low = km.fit_dp$lower,
+                                high = km.fit_dp$upper,
+                                z = "95% KM_n3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = km.fit_pop$time,
+                                low = km.fit_pop$lower,
+                                high = km.fit_pop$upper,
+                                z = "95% KM_external"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  scale_fill_manual(values = c("dodgerblue", "tomato", "darkolivegreen3", "violet", "goldenrod1", "antiquewhite2"),
+                    name = NULL,
+                    breaks = c("95% 3N", "95% n3N", "95% external", "95% KM_3N", "95% KM_n3N", "95% KM_external"),
+                    labels = c("95% 3N", "95% n3N", "95% external", "95% KM_3N", "95% KM_n3N", "95% KM_external")) +
+  scale_color_manual(values = c("steelblue4", "red2", "forestgreen", "blueviolet", "orange4", "antiquewhite4"),
+                     name = NULL,
+                     breaks = c("3N", "n3N", "external", "KM_3N", "KM_n3N", "KM_external"),
+                     labels = c("3N", "n3N", "external", "KM_3N", "KM_n3N", "KM_external")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 356, by = 24)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(xlim = c(0, 356), ylim = c(0, 1)) +
+  labs(x = "Time (months)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("surv_fun1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = haz.bcn.med,
+                              z = "3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = emp.haz_dn.times,
+                              y = emp.haz_dn,
+                              z = "emp_3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = haz.bcp.med,
+                              z = "n3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = emp.haz_dp.times,
+                              y = emp.haz_dp,
+                              z = "emp_n3N"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med,
+                              z = "external"),
+            aes(x = x, y = y, color = z)) +
+  geom_line(data = data.frame(x = emp.haz_pop.times,
+                              y = emp.haz_pop,
+                              z = "emp_external"),
+            aes(x = x, y = y, color = z)) +
+  geom_ribbon(data = data.frame(x = dat_dn$time,
+                                low = haz.bcn.q3,
+                                high = haz.bcn.q4,
+                                z = "95% 3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = dat_dp$time,
+                                low = haz.bcp.q3,
+                                high = haz.bcp.q4,
+                                z = "95% n3N"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  geom_ribbon(data = data.frame(x = dat_pop$time,
+                                low = haz.pop.q3,
+                                high = haz.pop.q4,
+                                z = "95% external"),
+              aes(x = x, ymin = low, ymax = high, fill = z), alpha = 0.5) +
+  scale_fill_manual(values = c("dodgerblue", "tomato", "darkolivegreen3"),
+                    name = NULL,
+                    breaks = c("95% 3N", "95% n3N", "95% external"),
+                    labels = c("95% 3N", "95% n3N", "95% external")) +
+  scale_color_manual(values = c("steelblue4", "red2", "forestgreen", "violet", "orange4", "antiquewhite"),
+                     name = NULL,
+                     breaks = c("3N", "n3N", "external", "emp_3N", "emp_n3N", "emp_external"),
+                     labels = c("3N", "n3N", "external", "emp_3N", "emp_n3N", "emp_external")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 356, by = 24)) +
+  scale_y_continuous(breaks = seq(0, 0.06, by = 0.006)) +
+  coord_cartesian(xlim = c(0, 356), ylim = c(0, 0.06)) +
+  labs(x = "Time (months)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("haz_fun1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Hazard components
+ggplot() +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = haz.bcn.med,
+                              z = "3N",
+                              g = "total"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = haz.bcn.med.c1,
+                              z = "3N",
+                              g = "comp.1"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = haz.bcn.med.c2,
+                              z = "3N",
+                              g = "comp.2"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dn$time,
+                              y = haz.bcn.med.c3,
+                              z = "3N",
+                              g = "comp.3"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = haz.bcp.med,
+                              z = "n3N",
+                              g = "total"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = haz.bcp.med.c1,
+                              z = "n3N",
+                              g = "comp.1"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = haz.bcp.med.c2,
+                              z = "n3N",
+                              g = "comp.2"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_dp$time,
+                              y = haz.bcp.med.c3,
+                              z = "n3N",
+                              g = "comp.3"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med,
+                              z = "external",
+                              g = "total"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med.c1,
+                              z = "external",
+                              g = "comp.1"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med.c2,
+                              z = "external",
+                              g = "comp.2"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  geom_line(data = data.frame(x = dat_pop$time,
+                              y = haz.pop.med.c3,
+                              z = "external",
+                              g = "comp.3"),
+            aes(x = x, y = y, color = z, linetype = g)) +
+  scale_linetype_manual(values = c("solid", "dashed", "dotted", "dotdash"),
+                        name = NULL,
+                        breaks = c("total", "comp.1", "comp.2", "comp.3"),
+                        labels = c("total", "comp.1", "comp.2", "comp.3")) +
+  scale_color_manual(values = c("blue", "red2", "seagreen"),
+                     name = NULL,
+                     breaks = c("3N", "n3N", "external"),
+                     labels = c("3N", "n3N", "external")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 356, by = 24)) +
+  scale_y_continuous(breaks = seq(0, 0.02, by = 0.001)) +
+  coord_cartesian(xlim = c(0, 356), ylim = c(0, 0.02)) +
+  labs(x = "Time (months)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("haz_fun_comp_zoom.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+

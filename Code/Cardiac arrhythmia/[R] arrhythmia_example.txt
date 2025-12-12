@@ -1,0 +1,575 @@
+
+############################################
+#----- Weibull cause-specific hazards -----#
+############################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Nice plots
+library(ggplot2)
+
+# Kaplan-Meier and empirical hazard estimate
+library(survival)
+library(muhaz)
+
+# Gauss-Kronrod quadrature
+library(pracma)
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+## Functions ##
+
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+# Generate (monthly) times to event
+# 
+# x : vector of survival each year
+# N : size of sample you need
+# 
+tgen <- function(x, N){
+  w.surv <- x
+  Npop <- N
+  
+  w.surv[which(is.na(w.surv))] <- 0
+  atrisk <- numeric(length(w.surv))
+  sumev <- numeric(length(w.surv))
+  atrisk[1] <- Npop
+  sumev[1] <- round(atrisk[1] - w.surv[1]*atrisk[1])
+  for(i in 2:length(w.surv)){
+    atrisk[i] <- atrisk[i-1] - sumev[i-1]
+    sumev[i] <- round((w.surv[i-1]*atrisk[i] - w.surv[i]*atrisk[i]) / w.surv[i-1]) # number of events at each time
+  }
+  atrisk[which(is.nan(atrisk))] <- 0
+  sumev[which(is.nan(sumev))] <- 0
+  timetoev <- NULL
+  for(i in 1:length(sumev)){
+    times.ext <- runif(sumev[i], (i-1)*12, i*12) # convert annual events to monthly events
+    timetoev <- c(timetoev, sort(times.ext)) # times to event for the external population
+  }
+  
+  return(timetoev = timetoev)
+}
+
+
+#####
+# Data
+
+
+# ICD data
+dat_d <- read.csv("surv_icd.csv", header = TRUE)
+colnames(dat_d) <- c("time", "status")
+dat_d$time <- dat_d$time*12 # convert to months
+
+
+## External population ##
+
+
+set.seed(123456)
+
+# Load the next year survival matrix
+source("surv_f.R") # for females
+source("surv_m.R") # for males
+
+# Keep only the ages of the dataset
+surv_f <- surv_f[, 1+17:98]
+surv_m <- surv_m[, 1+17:98]
+
+# ICD deaths for men for each age
+prop_age_m <- read.csv("prop_m.csv", header = TRUE)
+prop_age_m <- prop_age_m[-c(1:3), 3] # keep ages of the dataset
+
+# ICD deaths for women for each age
+prop_age_f <- read.csv("prop_f.csv", header = TRUE)
+prop_age_f <- prop_age_f[-c(1:3), 3] # keep ages of the dataset
+
+# Melt age groups and make proportions for each age
+props_age_m <- c(rep(prop_age_m[1]/3, 3),
+                 rep(prop_age_m[-c(1, length(prop_age_m))]/5, each = 5),
+                 rep(prop_age_m[length(prop_age_m)]/4, 4))
+props_age_f <- c(rep(prop_age_f[1]/3, 3),
+                 rep(prop_age_f[-c(1, length(prop_age_f))]/5, each = 5),
+                 rep(prop_age_f[length(prop_age_f)]/4, 4))
+
+# Proportions for every age
+xx <- seq(17, 98, length.out = 1e3)
+plot(xx, 0.66*dnorm(xx, 65, 7)+0.34*dnorm(xx, 52, 12), type = "l")
+0.66*pnorm(80, 65, 7)+0.34*pnorm(50, 52, 12) # should be approximately 80%
+p <- NULL
+p[1] <- (0.66*pnorm(18, 65, 7)+0.34*pnorm(18, 52, 12)) - (0.66*pnorm(17, 65, 7)+0.34*pnorm(17, 52, 12))
+for(s in 2:(98-17+1)){
+  p[s] <- (0.66*pnorm(s+17, 65, 7)+0.34*pnorm(s+17, 52, 12)) - (0.66*pnorm(s+16, 65, 7)+0.34*pnorm(s+16, 52, 12))
+}
+props.age <- p
+
+Npop <- 1e4 # total external population size we need
+
+# Generate some times for each age (and for each sex)
+times.age.f <- apply(surv_f, 2, tgen, N = Npop)
+times.age.m <- apply(surv_m, 2, tgen, N = Npop)
+
+# Sample for each age
+times.age.f.new.oc <- times.age.f.new.ci <- NULL
+for(i in 1:ncol(times.age.f)){
+  ind.oc <- sample(1:nrow(times.age.f), size = ceiling(Npop*props.age*(1-props_age_f)*(1-0.81))[i])
+  times.age.f.new.oc <- c(times.age.f.new.oc, times.age.f[ind.oc, i])
+  ind.ci <- sample(1:nrow(times.age.f), size = ceiling(Npop*props.age*props_age_f*(1-0.81))[i])
+  while(sum(ind.ci %in% ind.oc) > 1){
+    ind.ci <- sample(1:nrow(times.age.f), size = ceiling(Npop*props.age*props_age_f*(1-0.81))[i])
+  }
+  times.age.f.new.ci <- c(times.age.f.new.ci, times.age.f[ind.ci, i])
+}
+times.age.m.new.oc <- times.age.m.new.ci <- NULL
+for(i in 1:ncol(times.age.m)){
+  ind.oc <- sample(1:nrow(times.age.m), size = ceiling(Npop*props.age*(1-props_age_m)*0.81)[i])
+  times.age.m.new.oc <- c(times.age.m.new.oc, times.age.m[ind.oc, i])
+  ind.ci <- sample(1:nrow(times.age.m), size = ceiling(Npop*props.age*props_age_m*0.81)[i])
+  while(sum(ind.ci %in% ind.oc) > 1){
+    ind.ci <- sample(1:nrow(times.age.m), size = ceiling(Npop*props.age*props_age_m*0.81)[i])
+  }
+  times.age.m.new.ci <- c(times.age.m.new.ci, times.age.m[ind.ci, i])
+}
+
+# Final times to event
+timetoev.oc <- sort(c(times.age.f.new.oc, times.age.m.new.oc))
+timetoev.ci <- sort(c(times.age.f.new.ci, times.age.m.new.ci))
+
+
+#####
+# Non-parametrics
+
+
+# KM, NA and empirical hazard for ICD
+km.fit_d <- survfit(Surv(time, status) ~ 1, data = dat_d)
+naest_d <- cumsum(km.fit_d$n.event/km.fit_d$n.risk)
+emp.haz_d <- muhaz(dat_d$time, dat_d$status, max.time = 101)$haz.est # max time is 101.052 months
+emp.haz_d.times <- muhaz(dat_d$time, dat_d$status, max.time = 101)$est.grid
+
+
+#####
+# Stan models
+
+
+# Weibull cause-specific hazards
+mod <- "
+data {
+  int<lower=0> N_d;                             // number of individuals in ICD
+  int<lower=0> N_pop_ci;                        // general population for the cause of interest
+  int<lower=0> N_pop_oc;                        // general population for other causes
+  real<lower=0> times_d[N_d];                   // times to event or censoring for ICD
+  real<lower=0> times_pop_ci[N_pop_ci];         // times for the cause of interest (ext pop)
+  real<lower=0> times_pop_oc[N_pop_oc];         // times for other causes (ext pop)
+  real<lower=0,upper=1> event_d[N_d];           // 1=event, 0=censor (for ICD)
+  real<lower=0,upper=1> event_pop_ci[N_pop_ci]; // 1=event, 0=censor (for ext cause of interest)
+  real<lower=0,upper=1> event_pop_oc[N_pop_oc]; // 1=event, 0=censor (for ext other causes)
+}
+
+parameters {
+  positive_ordered[2] shape_pop;          // shape parameters for the external population
+  vector<lower=0>[2] rate_pop;            // rate parameters for the external population
+  real<lower=0> C;                        // hazard ratio for ICD/ext
+}
+
+transformed parameters {
+  real<lower=0> h_pop;
+  vector<lower=0>[2] h_d;
+  real logS_pop;
+  vector[2] logS_d;
+  vector[N_pop_ci] loglik_pop_ci;
+  vector[N_pop_oc] loglik_pop_oc;
+  vector[N_d] loglik_d;
+  
+  // External population
+  for(i in 1:N_pop_ci){
+    h_pop = rate_pop[1] * shape_pop[1] * pow(times_pop_ci[i], shape_pop[1] - 1);
+    logS_pop = - rate_pop[1] * pow(times_pop_ci[i], shape_pop[1]);
+    loglik_pop_ci[i] = event_pop_ci[i]*log(h_pop) + logS_pop;
+  }
+  for(i in 1:N_pop_oc){
+    h_pop = rate_pop[2] * shape_pop[2] * pow(times_pop_oc[i], shape_pop[2] - 1);
+    logS_pop = - rate_pop[2] * pow(times_pop_oc[i], shape_pop[2]);
+    loglik_pop_oc[i] = event_pop_oc[i]*log(h_pop) + logS_pop;
+  }
+  // Disease group
+  for(i in 1:N_d){
+    h_d[1] = C * (rate_pop[1] * shape_pop[1] * pow(times_d[i], shape_pop[1] - 1));
+    logS_d[1] = C * (- rate_pop[1] * pow(times_d[i], shape_pop[1]));
+    h_d[2] = rate_pop[2] * shape_pop[2] * pow(times_d[i], shape_pop[2] - 1);
+    logS_d[2] = - rate_pop[2] * pow(times_d[i], shape_pop[2]);
+    loglik_d[i] = event_d[i]*log(sum(h_d)) + sum(logS_d);
+  }
+}
+
+model {
+  for(i in 1:2){
+    target += exponential_lpdf(shape_pop[i] | 0.1);
+    target += gamma_lpdf(rate_pop[i] | 2, 0.5);        // mean = 2 / 0.5 (shape,rate)
+  }
+  target += exponential_lpdf(C | 0.1);
+
+  target += sum(loglik_d);
+  target += sum(loglik_pop_ci);
+  target += sum(loglik_pop_oc);
+}
+"
+stan_mod <- stan_model(model_code = mod)
+
+
+#####
+# Modeling
+
+
+dat_d <- dat_d[order(dat_d$time), ]; rownames(dat_d) <- 1:nrow(dat_d)
+dat_pop.oc <- data.frame(time = timetoev.oc,
+                         status = 1)
+dat_pop.ci <- data.frame(time = timetoev.ci,
+                         status = 1)
+
+# The stan data
+stan_data <- within(list(), {
+  N_d <- nrow(dat_d)
+  N_pop_ci <- nrow(dat_pop.ci)
+  N_pop_oc <- nrow(dat_pop.oc)
+  times_d <- dat_d$time
+  times_pop_ci <- dat_pop.ci$time
+  times_pop_oc <- dat_pop.oc$time
+  event_d <- dat_d$status
+  event_pop_ci <- dat_pop.ci$status
+  event_pop_oc <- dat_pop.oc$status})
+
+# Stan parameters
+stan_chains <- 3
+stan_warmup <- 500
+stan_iter <- 5e3 + stan_warmup
+stan_delta <- 0.98
+stan_tree <- 14
+stan_thin <- 1
+stan_seed <- 12345
+
+# Set initial values
+stan_init <- list(
+  list(shape_pop = c(1, 2),
+       rate_pop = c(0.05, 0.1),
+       C = 1.5),
+  list(shape_pop = c(0.8, 1.5),
+       rate_pop = c(0.01, 0.005),
+       C = 1),
+  list(shape_pop = c(0.5, 0.9),
+       rate_pop = c(0.005, 0.001),
+       C = 3))
+
+# Run NUTS
+time.start_nuts <- Sys.time()
+nuts_fit <- sampling(stan_mod,
+                     data = stan_data,
+                     iter = stan_iter,
+                     init = stan_init,
+                     chains = stan_chains,
+                     warmup = stan_warmup,
+                     thin = stan_thin,
+                     seed = stan_seed,
+                     control = list(adapt_delta = stan_delta,
+                                    max_treedepth = stan_tree))
+time.end_nuts <- Sys.time()
+duration_nuts <- time.end_nuts - time.start_nuts
+
+fit_summary <- summary(nuts_fit, pars = c("shape_pop", "rate_pop", "C"))$summary
+print(fit_summary, digits = 2)
+
+# Divergent transitions, exceeded treedepth
+check_divergences(nuts_fit)
+check_treedepth(nuts_fit)
+
+# Extract posterior samples
+post <- extract(nuts_fit,
+                pars = c("shape_pop", "rate_pop", "C"),
+                permuted = FALSE,
+                inc_warmup = TRUE,
+                include = TRUE)
+post_no_warm <- post[(stan_warmup+1):dim(post)[1], , ] # exclude the warmu-up period
+
+# Check the autoccorrelation
+# apply(post_no_warm[, 1, ], 2, acf)
+acf(post_no_warm[, 1, c("shape_pop[1]")]) # the first chain of the first parameter
+
+# Fix autocorrelation
+keep <- seq(1, stan_iter - stan_warmup, by = 5) # keep one every 5 samples
+post_noac <- post_no_warm[keep, , ]
+acf(post_noac[, 1, c("shape_pop[1]")]) # the first chain of the first parameter
+
+# saveRDS(nuts_fit, "Weib_cs_haz.rds") # save the results
+# nuts_fit <- readRDS("Weib_cs_haz.rds") # load the objects into R
+
+# Estimated parameters
+alphas_pop <- rbind(post_noac[, 1, c("shape_pop[1]", "shape_pop[2]")],
+                    post_noac[, 2, c("shape_pop[1]", "shape_pop[2]")],
+                    post_noac[, 3, c("shape_pop[1]", "shape_pop[2]")]) # shapes
+lambdas_pop <- rbind(post_noac[, 1, c("rate_pop[1]", "rate_pop[2]")],
+                     post_noac[, 2, c("rate_pop[1]", "rate_pop[2]")],
+                     post_noac[, 3, c("rate_pop[1]", "rate_pop[2]")]) # rates
+hr <- c(post_noac[, 1, "C"],
+        post_noac[, 2, "C"],
+        post_noac[, 3, "C"]) # hazard ratio for the 1st component
+
+# Disease
+h_d <- logS_d <- array(NA, dim = c(nrow(dat_d), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:nrow(dat_d)){
+  for(j in 1:nrow(lambdas_pop)){
+    h_d[i, j, 1] <-  hr[j] * (lambdas_pop[j, 1] * alphas_pop[j, 1] * dat_d$time[i]^(alphas_pop[j, 1] - 1))
+    logS_d[i, j, 1] <- hr[j] * (- lambdas_pop[j, 1] * dat_d$time[i]^alphas_pop[j, 1])
+    h_d[i, j, 2] <- lambdas_pop[j, 2] * alphas_pop[j, 2] * dat_d$time[i]^(alphas_pop[j, 2] - 1)
+    logS_d[i, j, 2] <- - lambdas_pop[j, 2] * dat_d$time[i]^alphas_pop[j, 2]
+  }
+}
+total_hazard_d <- apply(h_d, c(1, 2), sum)
+total_lsurvival_d <- apply(logS_d, c(1, 2), sum)
+
+# "cause of interest" external population
+h_pop.ci <- logS_pop.ci <- matrix(NA, nrow(dat_pop.ci), nrow(lambdas_pop))
+for(i in 1:nrow(dat_pop.ci)){
+  for(j in 1:nrow(lambdas_pop)){
+    h_pop.ci[i, j] <- lambdas_pop[j, 1] * alphas_pop[j, 1] * dat_pop.ci$time[i]^(alphas_pop[j, 1] - 1)
+    logS_pop.ci[i, j] <- - lambdas_pop[j, 1] * dat_pop.ci$time[i]^alphas_pop[j, 1]
+  }
+}
+
+# "other causes" external population
+h_pop.oc <- logS_pop.oc <- matrix(NA, nrow(dat_pop.oc), nrow(lambdas_pop))
+for(i in 1:nrow(dat_pop.oc)){
+  for(j in 1:nrow(lambdas_pop)){
+    h_pop.oc[i, j] <- lambdas_pop[j, 2] * alphas_pop[j, 2] * dat_pop.oc$time[i]^(alphas_pop[j, 2] - 1)
+    logS_pop.oc[i, j] <- - lambdas_pop[j, 2] * dat_pop.oc$time[i]^alphas_pop[j, 2]
+  }
+}
+
+
+#####
+# Results
+
+
+# Total external population
+yy <- seq(0, 1e3, length.out = 2e3)
+h_pop.t <- logS_pop.t <- array(NA, dim = c(length(yy), nrow(lambdas_pop), ncol(lambdas_pop)))
+for(i in 1:length(yy)){
+  for(j in 1:nrow(lambdas_pop)){
+    h_pop.t[i, j, 1] <- lambdas_pop[j, 1] * alphas_pop[j, 1] * yy[i]^(alphas_pop[j, 1] - 1)
+    logS_pop.t[i, j, 1] <- - lambdas_pop[j, 1] * yy[i]^alphas_pop[j, 1]
+    h_pop.t[i, j, 2] <- lambdas_pop[j, 2] * alphas_pop[j, 2] * yy[i]^(alphas_pop[j, 2] - 1)
+    logS_pop.t[i, j, 2] <- - lambdas_pop[j, 2] * yy[i]^alphas_pop[j, 2]
+  }
+}
+total_hazard_pop <- apply(h_pop.t, c(1, 2), sum)
+total_lsurvival_pop <- apply(logS_pop.t, c(1, 2), sum)
+
+# Form the survival and hazard
+haz_d <- total_hazard_d
+haz_d1 <- h_d[, , 1]
+haz_d2 <- h_d[, , 2]
+sur_d <- exp(total_lsurvival_d)
+haz_pop <- total_hazard_pop
+haz_pop1 <- h_pop.t[, , 1]
+haz_pop2 <- h_pop.t[, , 2]
+sur_pop <- exp(total_lsurvival_pop)
+haz_pop.ci <- h_pop.ci
+sur_pop.ci <- exp(logS_pop.ci)
+haz_pop.oc <- h_pop.oc
+sur_pop.oc <- exp(logS_pop.oc)
+
+# Deduce the AAD hazard
+h_a <- array(NA, dim = c(nrow(dat_d), nrow(lambdas_pop), ncol(lambdas_pop)))
+h_a[, , 1] <- 2*h_d[, , 1]
+h_a[, , 2] <- h_d[, , 2]
+haz_a <- apply(h_a, c(1, 2), sum)
+
+# Hazard function for time x and iteration j (for cumulative hazard construction)
+hazfun <- function(x, j){
+  hazcompit <- matrix(NA, nrow = length(x), ncol = ncol(lambdas_pop))
+  hazcompit[, 1] <- hr[j] * (lambdas_pop[j, 1] * alphas_pop[j, 1] * x^(alphas_pop[j, 1] - 1))
+  hazcompit[, 2] <- lambdas_pop[j, 2] * alphas_pop[j, 2] * x^(alphas_pop[j, 2] - 1)
+  icd_haz <- apply(hazcompit, 1, sum)
+  
+  hazcompit2 <- matrix(NA, nrow = length(x), ncol = ncol(lambdas_pop))
+  hazcompit2[, 1] <- 2*hazcompit[, 1]
+  hazcompit2[, 2] <- 1.39*icd_haz - hazcompit2[, 1]
+  aad_haz <- apply(hazcompit2, 1, sum)
+  
+  return(aad_haz)
+}
+
+# Cumulative hazard
+cumhaz_a <- NULL
+for(j in 1:ncol(haz_a)){
+  temp <- NULL
+  for(i in dat_d$time){
+    temp <- c(temp, gauss_kronrod(hazfun, a = 0, b = i, j = j)$value)
+  }
+  cumhaz_a <- cbind(cumhaz_a, temp)
+}
+
+# Convert to survival and odds
+sur_a <- exp(-cumhaz_a)
+odds_a <- (1-sur_a) / sur_a
+
+# Create summary statistics
+sur.icd.q3 <- apply(sur_d, 1, q3)
+sur.icd.q4 <- apply(sur_d, 1, q4)
+sur.icd.med <- apply(sur_d, 1, median)
+haz.icd.q3 <- apply(haz_d, 1, q3)
+haz.icd.q4 <- apply(haz_d, 1, q4)
+haz.icd.med <- apply(haz_d, 1, median)
+haz.icd.med.c1 <- apply(haz_d1, 1, median)
+haz.icd.med.c2 <- apply(haz_d2, 1, median)
+sur.aad.q3 <- apply(sur_a, 1, q3)
+sur.aad.q4 <- apply(sur_a, 1, q4)
+sur.aad.med <- apply(sur_a, 1, median)
+haz.aad.q3 <- apply(haz_a, 1, q3)
+haz.aad.q4 <- apply(haz_a, 1, q4)
+haz.aad.med <- apply(haz_a, 1, median)
+sur.pop.ci.q3 <- apply(sur_pop.ci, 1, q3)
+sur.pop.ci.q4 <- apply(sur_pop.ci, 1, q4)
+sur.pop.ci.med <- apply(sur_pop.ci, 1, median)
+haz.pop.ci.q3 <- apply(haz_pop.ci, 1, q3)
+haz.pop.ci.q4 <- apply(haz_pop.ci, 1, q4)
+haz.pop.ci.med <- apply(haz_pop.ci, 1, median)
+sur.pop.oc.q3 <- apply(sur_pop.oc, 1, q3)
+sur.pop.oc.q4 <- apply(sur_pop.oc, 1, q4)
+sur.pop.oc.med <- apply(sur_pop.oc, 1, median)
+haz.pop.oc.q3 <- apply(haz_pop.oc, 1, q3)
+haz.pop.oc.q4 <- apply(haz_pop.oc, 1, q4)
+haz.pop.oc.med <- apply(haz_pop.oc, 1, median)
+sur.pop.q3 <- apply(sur_pop, 1, q3)
+sur.pop.q4 <- apply(sur_pop, 1, q4)
+sur.pop.med <- apply(sur_pop, 1, median)
+haz.pop.q3 <- apply(haz_pop, 1, q3)
+haz.pop.q4 <- apply(haz_pop, 1, q4)
+haz.pop.med <- apply(haz_pop, 1, median)
+
+# # Save
+# save.list <- list(sur.aad.q3 = sur.aad.q3, sur.aad.q4 = sur.aad.q4, sur.aad.med = sur.aad.med,
+#                   haz.aad.q3 = haz.aad.q3, haz.aad.q4 = haz.aad.q4, haz.aad.med = haz.aad.med,
+#                   sur.icd.q3 = sur.icd.q3, sur.icd.q4 = sur.icd.q4, sur.icd.med = sur.icd.med,
+#                   haz.icd.q3 = haz.icd.q3, haz.icd.q4 = haz.icd.q4, haz.icd.med = haz.icd.med,
+#                   haz.icd.med.c1 = haz.icd.med.c1, haz.icd.med.c2 = haz.icd.med.c2,
+#                   sur.pop.q3 = sur.pop.q3, sur.pop.q4 = sur.pop.q4, sur.pop.med = sur.pop.med,
+#                   haz.pop.q3 = haz.pop.q3, haz.pop.q4 = haz.pop.q4, haz.pop.med = haz.pop.med,
+#                   sur.pop.ci.q3 = sur.pop.ci.q3, sur.pop.ci.q4 = sur.pop.ci.q4, sur.pop.ci.med = sur.pop.ci.med,
+#                   haz.pop.ci.q3 = haz.pop.ci.q3, haz.pop.ci.q4 = haz.pop.ci.q4, haz.pop.ci.med = haz.pop.ci.med,
+#                   sur.pop.oc.q3 = sur.pop.oc.q3, sur.pop.oc.q4 = sur.pop.oc.q4, sur.pop.oc.med = sur.pop.oc.med,
+#                   haz.pop.oc.q3 = haz.pop.oc.q3, haz.pop.oc.q4 = haz.pop.oc.q4, haz.pop.oc.med = haz.pop.oc.med)
+# dump("save.list", "Weib_cs_haz.R")
+
+
+## Results ##
+
+
+# Suvival function
+ggplot() +
+  geom_line(data = data.frame(x = dat_d$time,
+                              y = sur.icd.med,
+                              z = "ICD",
+                              l = "ICD"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = dat_d$time,
+                              y = sur.aad.med,
+                              z = "AAD",
+                              l = "AAD"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = yy,
+                              y = sur.pop.med,
+                              z = "external",
+                              l = "external"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_step(data = data.frame(x = km.fit_d$time,
+                              y = km.fit_d$surv,
+                              z = "KM_ICD",
+                              l = "KM_ICD"),
+            aes(x = x, y = y, color = z, linetype = l), direction = "hv") +
+  scale_color_manual(values = c("dodgerblue", "red2", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("ICD", "AAD", "external", "KM_ICD"),
+                     labels = c("ICD", "AAD", "external", "KM_ICD")) +
+  scale_linetype_manual(values = c("dashed", "dotted", "dotdash", "solid"),
+                        name = NULL,
+                        breaks = c("ICD", "AAD", "external", "KM_ICD"),
+                        labels = c("ICD", "AAD", "external", "KM_ICD")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 132, by = 8)) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, 132)) +
+  labs(x = "Time (months)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("surv_fun_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = dat_d$time,
+                              y = haz.icd.med,
+                              z = "ICD",
+                              l = "ICD"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = emp.haz_d.times,
+                              y = emp.haz_d,
+                              z = "emp_ICD",
+                              l = "emp_ICD"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = dat_d$time,
+                              y = haz.aad.med,
+                              z = "AAD",
+                              l = "AAD"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  geom_line(data = data.frame(x = yy,
+                              y = haz.pop.med,
+                              z = "external",
+                              l = "external"),
+            aes(x = x, y = y, color = z, linetype = l)) +
+  scale_color_manual(values = c("dodgerblue", "red2", "forestgreen", "blueviolet"),
+                     name = NULL,
+                     breaks = c("ICD", "AAD", "external", "emp_ICD"),
+                     labels = c("ICD", "AAD", "external", "emp_ICD")) +
+  scale_linetype_manual(values = c("dashed", "dotted", "dotdash", "solid"),
+                        name = NULL,
+                        breaks = c("ICD", "AAD", "external", "emp_ICD"),
+                        labels = c("ICD", "AAD", "external", "emp_ICD")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 132, by = 8)) +
+  scale_y_continuous(breaks = seq(0, 0.016, by = 0.004)) +
+  coord_cartesian(ylim = c(0, 0.016), xlim = c(0, 132)) +
+  labs(x = "Time (months)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("haz_fun_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)

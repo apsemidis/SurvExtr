@@ -1,0 +1,383 @@
+
+###################################
+#----- Mortality projections -----#
+###################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Data manipulation
+library(data.table)
+
+# Run the Lee-Carter model
+library(BayesMortalityPlus)
+
+# Nice plots
+library(ggplot2)
+library(gridExtra)
+
+
+#####
+# The data
+
+
+# Yearly mortality rates per age
+dat <- fread("death_rates.csv")
+
+# Years you want to keep
+first_year <- 1960
+last_year <- 2022
+
+# Ages you want to keep
+first_age <- 1
+last_age <- 104
+
+# Keep years first_year-last_year
+dat <- dat[-c(which(dat$Year < first_year)), ]
+dat <- dat[, -5]
+dat$Female <- as.numeric(dat$Female)
+dat$Male <- as.numeric(dat$Male)
+
+# Remove large ages
+dat[which(is.na(dat$Male)), ]
+dat <- dat[dat$Age %in% paste(1:last_age), ]
+sum(is.na(dat)) # no NA's
+dat$Age <- as.numeric(dat$Age)
+rownames(dat) <- 1:nrow(dat)
+
+
+#####
+# BLC model - females
+
+
+# Run the model
+Y <- matrix(NA, nrow = length(1:last_age), ncol = length(first_year:last_year))
+for(j in 1:ncol(Y)){
+  Y[, j] <- log(dat$Female[dat$Year == first_year-1+j])
+}
+colnames(Y) <- first_year:last_year
+rownames(Y) <- 1:last_age
+names(dimnames(Y)) <- list("Age", "Year")
+set.seed(12345)
+fit.blc_f <- blc(Y,
+                 prior = list(m0 = 0,
+                              C0 = 100),
+                 init = list(alpha = runif(nrow(Y)),
+                             beta = runif(nrow(Y)),
+                             phiv = rep(1, nrow(Y)),
+                             phiw = 1,
+                             theta = runif(1)),
+                 M = 5e3,
+                 bn = 4e3,
+                 thin = 1) # result does not include burn-in
+
+# Settings used
+n_year <- nrow(fit.blc_f$kappa)
+n_age <- nrow(fit.blc_f$alpha)
+n_iter <- fit.blc_f$M - fit.blc_f$bn
+
+# Visualize log-mortality rates per age per year for Females
+ggdt <- dat
+ggdt$Year <- as.factor(ggdt$Year)
+plot1 <- ggplot(data = ggdt, aes(x = Age, y = log(Female), color = Year)) +
+  geom_point() +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  scale_color_manual(name = NULL,
+                     values = c(rainbow(last_year-first_year+1)),
+                     label = first_year:last_year) +
+  labs(x = "Age",
+       y = "log-mortality rate - Females",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("logmorrates_f.png", device = "png", width = 10, height = 8, units = "in", dpi = 600)
+
+# Log-mortality for each age
+plot2 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_age,
+                              y = apply(fit.blc_f$alpha, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_age,
+                                low = apply(fit.blc_f$alpha, 1, q3),
+                                high = apply(fit.blc_f$alpha, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  theme_bw() +
+  labs(x = "Age",
+       y = expression(alpha[x]),
+       title = "alpha parameter - Females") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.alpha_f.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# Rate of change of the log-mortality for each age
+plot3 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_age,
+                              y = apply(fit.blc_f$beta, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_age,
+                                low = apply(fit.blc_f$beta, 1, q3),
+                                high = apply(fit.blc_f$beta, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  theme_bw() +
+  labs(x = "Age",
+       y = expression(beta[x]),
+       title = "beta parameter - Females") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.beta_f.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# Level of log-mortality for each year
+plot4 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_year,
+                              y = apply(fit.blc_f$kappa, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_year,
+                                low = apply(fit.blc_f$kappa, 1, q3),
+                                high = apply(fit.blc_f$kappa, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(1, n_year, by = 10),
+                     labels = seq(first_year, last_year, by = 10)) +
+  theme_bw() +
+  labs(x = "Year",
+       y = expression(kappa[t]),
+       title = "kappa parameter - Females") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.kappa_f.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# ggsave("mor_f.png", grid.arrange(plot1, plot2, plot3, plot4, ncol = 2), device = "png",
+#        width = 14, height = 9, units = "in", dpi = 600)
+
+
+## Predictions ##
+
+
+# Forecasts for.h years ahead (data up to 2022, now is 2025, so you need last_age + 2)
+for.h <- last_age+2
+pred.blc_f <- predict(fit.blc_f, h = for.h)
+
+# Predicted mortality for years up to 2023+1+104
+preds_f <- apply(exp(pred.blc_f$y), c(3, 2), mean)
+dimnames(preds_f) <- list(Age = 1:last_age, Year = (last_year+1):(last_year+for.h))
+
+# Age-specific survival
+start_col <- which(colnames(preds_f) == "2025")
+preds_f2 <- preds_f[, -c(1:(start_col-1))]
+surv_f <- matrix(NA, nrow = nrow(preds_f2), ncol = nrow(preds_f2))
+diags <- diag(preds_f2)
+for(i in 1:nrow(preds_f2)){
+  ms <- diags[i:nrow(preds_f2)]
+  ps <- exp(-ms)
+  surv_f[, i] <- c(cumprod(ps), rep(NA, i-1))
+}
+rownames(surv_f) <- 1:nrow(preds_f2)
+colnames(surv_f) <- 1:nrow(preds_f2)
+surv_f <- as.data.frame(surv_f) # next year survival (column j is the survival prob. that a person aged j reaches j+...)
+
+ggdt <- surv_f[, seq(1, last_age, by = 15)]
+ggdt <- data.frame(x = 1:last_age,
+                   y = matrix(as.matrix(ggdt)),
+                   z = as.factor(rep(seq(1, last_age, by = 15), each = last_age)))
+ggplot() +
+  geom_point(data = ggdt,
+             aes(x = x, y = y, color = z)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, last_age, by = 13)) +
+  labs(x = "Time (years)",
+       y = "Survival - Females",
+       title = NULL,
+       color = "Age") +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("nextyearsurvival_f.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Save
+dump("surv_f", file = "surv_f.R")
+
+
+#####
+# BLC model - males
+
+
+# Run the model
+Y <- matrix(NA, nrow = length(1:last_age), ncol = length(first_year:last_year))
+for(j in 1:ncol(Y)){
+  Y[, j] <- log(dat$Male[dat$Year == first_year-1+j])
+}
+colnames(Y) <- first_year:last_year
+rownames(Y) <- 1:last_age
+names(dimnames(Y)) <- list("Age", "Year")
+set.seed(12345)
+fit.blc_m <- blc(Y,
+                 prior = list(m0 = 0,
+                              C0 = 100),
+                 init = list(alpha = runif(nrow(Y)),
+                             beta = runif(nrow(Y)),
+                             phiv = rep(1, nrow(Y)),
+                             phiw = 1,
+                             theta = runif(1)),
+                 M = 5e3,
+                 bn = 4e3,
+                 thin = 1) # result does not include burn-in
+
+# Settings used
+n_year <- nrow(fit.blc_m$kappa)
+n_age <- nrow(fit.blc_m$alpha)
+n_iter <- fit.blc_m$M - fit.blc_m$bn
+
+# Visualize log-mortality rates per age per year for Males
+ggdt <- dat
+ggdt$Year <- as.factor(ggdt$Year)
+plot1 <- ggplot(data = ggdt, aes(x = Age, y = log(Male), color = Year)) +
+  geom_point() +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  scale_color_manual(name = NULL,
+                     values = c(rainbow(last_year-first_year+1)),
+                     label = first_year:last_year) +
+  labs(x = "Age",
+       y = "log-mortality rate - Males",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("logmorrates_m.png", device = "png", width = 10, height = 8, units = "in", dpi = 600)
+
+# Log-mortality for each age
+plot2 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_age,
+                              y = apply(fit.blc_m$alpha, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_age,
+                                low = apply(fit.blc_m$alpha, 1, q3),
+                                high = apply(fit.blc_m$alpha, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  theme_bw() +
+  labs(x = "Age",
+       y = expression(alpha[x]),
+       title = "alpha parameter - Males") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.alpha_m.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# Rate of change of the log-mortality for each age
+plot3 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_age,
+                              y = apply(fit.blc_m$beta, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_age,
+                                low = apply(fit.blc_m$beta, 1, q3),
+                                high = apply(fit.blc_m$beta, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(first_age-1, last_age, by = 13)) +
+  theme_bw() +
+  labs(x = "Age",
+       y = expression(beta[x]),
+       title = "beta parameter - Males") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.beta_m.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# Level of log-mortality for each year
+plot4 <- ggplot() +
+  geom_line(data = data.frame(x = 1:n_year,
+                              y = apply(fit.blc_m$kappa, 1, median)),
+            aes(x = x, y = y), col = "blue") +
+  geom_ribbon(data = data.frame(x = 1:n_year,
+                                low = apply(fit.blc_m$kappa, 1, q3),
+                                high = apply(fit.blc_m$kappa, 1, q4)),
+              aes(x = x, ymin = low, ymax = high), alpha = 0.5, fill = "dodgerblue") +
+  scale_x_continuous(breaks = seq(1, n_year, by = 10),
+                     labels = seq(first_year, last_year, by = 10)) +
+  theme_bw() +
+  labs(x = "Year",
+       y = expression(kappa[t]),
+       title = "kappa parameter - Males") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "grey20"),
+        axis.title = element_text(size = 14),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.border = element_blank(),
+        panel.grid.minor = element_blank())
+# ggsave("fit.kappa_m.png", device = "png", width = 8, height = 5, units = "in", dpi = 600)
+
+# ggsave("mor_m.png", grid.arrange(plot1, plot2, plot3, plot4, ncol = 2), device = "png",
+#        width = 14, height = 9, units = "in", dpi = 600)
+
+## Predictions ##
+
+
+# Forecasts for.h years ahead (data up to 2022, now is 2025, so you need last_age + 2)
+for.h <- last_age+2
+pred.blc_m <- predict(fit.blc_m, h = for.h)
+
+# Predicted mortality for years up to 2023+1+104
+preds_m <- apply(exp(pred.blc_m$y), c(3, 2), mean)
+dimnames(preds_m) <- list(Age = 1:last_age, Year = (last_year+1):(last_year+for.h))
+
+# Age-specific survival
+start_col <- which(colnames(preds_m) == "2025")
+preds_m2 <- preds_m[, -c(1:(start_col-1))]
+surv_m <- matrix(NA, nrow = nrow(preds_m2), ncol = nrow(preds_m2))
+diags <- diag(preds_m2)
+for(i in 1:nrow(preds_m2)){
+  ms <- diags[i:nrow(preds_m2)]
+  ps <- exp(-ms)
+  surv_m[, i] <- c(cumprod(ps), rep(NA, i-1))
+}
+rownames(surv_m) <- 1:nrow(preds_m2)
+colnames(surv_m) <- 1:nrow(preds_m2)
+surv_m <- as.data.frame(surv_m) # next year survival (column j is the survival prob. that a person aged j reaches j+...)
+
+ggdt <- surv_m[, seq(1, last_age, by = 15)]
+ggdt <- data.frame(x = 1:last_age,
+                   y = matrix(as.matrix(ggdt)),
+                   z = as.factor(rep(seq(1, last_age, by = 15), each = last_age)))
+ggplot() +
+  geom_point(data = ggdt,
+             aes(x = x, y = y, color = z)) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, last_age, by = 13)) +
+  labs(x = "Time (years)",
+       y = "Survival - males",
+       title = NULL,
+       color = "Age") +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("nextyearsurvival_m.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Save
+dump("surv_m", file = "surv_m.R")
+
+
+

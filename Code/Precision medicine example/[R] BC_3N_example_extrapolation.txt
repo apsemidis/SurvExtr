@@ -1,0 +1,979 @@
+
+############################################
+#----- jTriLLogi; same 3rd comp; extr -----#
+############################################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Nice plots
+library(ggplot2)
+
+# Kaplan-Meier and empirical hazard estimate
+library(survival)
+library(muhaz)
+
+# Gauss-Kronrod quadrature
+library(pracma)
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+
+## Functions ##
+
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+# Functions for the hazard and log-survival function of a LogLogistic distribution
+# 
+# x     : time of event or censoring
+# shape : shape parameter of the distribution
+# scale : scale parameter of the distribution
+# 
+h_llogi <- function(x, shape, scale){
+  h <- (shape/scale) * (x/scale)^(shape-1) / (1+(x/scale)^shape)
+  
+  return(h)
+}
+logS_llogi <- function(x, shape, scale){
+  logS <- -log(1 + (x/scale)^shape)
+  
+  return(logS)
+}
+
+
+#####
+# Data
+
+
+# The whole dataset
+dat <- read.csv("brca_metabric_clinical_data.txt", header = TRUE, sep = "\t")
+dat <- dat[, c("Overall.Survival..Months.", "Overall.Survival.Status", "Age.at.Diagnosis",
+               "ER.Status", "HER2.Status", "PR.Status")]
+colnames(dat) <- c("time", "status", "age", "ER.Status", "HER2.Status", "PR.Status")
+
+# Convert to factors
+dat$ER.Status <- factor(dat$ER.Status)
+dat$HER2.Status <- factor(dat$HER2.Status)
+dat$PR.Status <- factor(dat$PR.Status)
+
+# Detect NA's
+tfna <- apply(dat, 2, is.na)
+apply(tfna, 2, sum)
+summary(dat)
+
+# Redat# Remove NA's from PR status (it removes all other NA's too)
+dat <- dat[-which(is.na(dat$PR.Status)), ]
+summary(dat)
+str(dat)
+
+# Make status numeric
+for(i in 1:nrow(dat)){
+  if(dat$status[i] == "0:LIVING"){
+    dat$status[i] <- 0
+  } else {
+    dat$status[i] <- 1
+  }
+}
+dat$status <- as.numeric(dat$status)
+
+# It has event time = 0
+dat <- dat[-186, ]
+dat <- dat[order(dat$time), ]
+rownames(dat) <- 1:nrow(dat)
+
+# Ages in the study
+dat$age <- floor(dat$age)
+
+# ER, HER2 and PR status
+# library(gmodels)
+# CrossTable(dat$ER.Status, dat$HER2.Status,
+#            prop.r = TRUE, prop.c = TRUE, prop.t = TRUE, prop.chisq = FALSE)
+ftable(dat$ER.Status, dat$HER2.Status, dat$PR.Status) # 1st column = ER, 2nd column = HER2, 3rd column = PR
+
+# Make the covariate
+dat$X <- numeric(nrow(dat))
+for(i in 1:nrow(dat)){
+  if(dat$ER.Status[i] == "Negative" & dat$HER2.Status[i] =="Negative" & dat$PR.Status[i] == "Negative"){
+    dat$X[i] <- 1
+  }
+}
+
+
+## External population ##
+
+
+# Load the next year survival matrix
+source("surv_f.R")
+
+# Proportions for every age
+props <- table(dat$age) / sum(table(dat$age))
+
+# Keep only the ages of the dataset
+surv <- surv_f[, 1+sort(unique(dat$age))]
+
+# Weighted average of next year survival
+weighted.mean <- function(x){
+  sum(x*props, na.rm = TRUE)/sum(props)
+}
+w.surv <- apply(surv, 1, weighted.mean)
+
+# Generate times to event
+set.seed(123456)
+Npop <- 5e3
+atrisk <- numeric(length(w.surv))
+sumev <- numeric(length(w.surv))
+atrisk[1] <- Npop
+sumev[1] <- round(atrisk[1] - w.surv[1]*atrisk[1])
+for(i in 2:length(w.surv)){
+  atrisk[i] <- atrisk[i-1] - sumev[i-1]
+  sumev[i] <- round((w.surv[i-1]*atrisk[i] - w.surv[i]*atrisk[i]) / w.surv[i-1]) # number of events at each time
+}
+atrisk[which(is.nan(atrisk))] <- 0
+sumev[which(is.nan(sumev))] <- 0
+timetoev <- NULL
+for(i in 1:length(sumev)){
+  times.ext <- runif(sumev[i], (i-1)*12, i*12) # convert annual events to monthly events
+  timetoev <- c(timetoev, sort(times.ext)) # times to event for the external population
+}
+
+
+#####
+# Non-parametrics
+
+
+# KM, NA and empirical hazard for the diseaase population (triple negative)
+dat_dn <- dat[which(dat$X == 1), c("time", "status")]
+km.fit_dn <- survfit(Surv(time, status) ~ 1, data = dat_dn)
+naest_dn <- cumsum(km.fit_dn$n.event/km.fit_dn$n.risk)
+emp.haz_dn <- muhaz(dat_dn$time, dat_dn$status)$haz.est # max time is 307.9333 months (267.4 is used)
+emp.haz_dn.times <- muhaz(dat_dn$time, dat_dn$status)$est.grid
+
+# KM, NA and empirical hazard for the diseaase population (not triple negative)
+dat_dp <- dat[which(dat$X == 0), c("time", "status")]
+km.fit_dp <- survfit(Surv(time, status) ~ 1, data = dat_dp)
+naest_dp <- cumsum(km.fit_dp$n.event/km.fit_dp$n.risk)
+emp.haz_dp <- muhaz(dat_dp$time, dat_dp$status)$haz.est # max time is 355.2 months (301.23 is used)
+emp.haz_dp.times <- muhaz(dat_dp$time, dat_dp$status)$est.grid
+
+# KM, NA and empirical hazard for the external population
+dat_pop <- data.frame(time = timetoev,
+                      status = 1)
+km.fit_pop <- survfit(Surv(time, status) ~ 1, data = dat_pop)
+naest_pop <- cumsum(km.fit_pop$n.event/km.fit_pop$n.risk)
+emp.haz_pop <- muhaz(dat_pop$time, dat_pop$status)$haz.est # max time is 999.769 months (818.88 is used)
+emp.haz_pop.times <- muhaz(dat_pop$time, dat_pop$status)$est.grid
+
+
+#####
+# Extrapolation
+
+
+dat_dn <- dat_dn[order(dat_dn$time), ]; rownames(dat_dn) <- 1:nrow(dat_dn)
+dat_dp <- dat_dp[order(dat_dp$time), ]; rownames(dat_dp) <- 1:nrow(dat_dp)
+
+# The fitted model
+nuts_fit <- readRDS("jTriLLogi_same_3rd_comp.rds")
+
+# Extract posterior samples
+stan_warmup <- 500
+stan_iter <- 5e3 + stan_warmup
+post <- extract(nuts_fit,
+                pars = c("alpha_pop", "sigma_pop", "alpha_dn12", "sigma_dn12", "alpha_dp12", "sigma_dp12",
+                         "alpha_dn_new", "sigma_dn_new", "alpha_dp_new", "sigma_dp_new"),
+                permuted = FALSE,
+                inc_warmup = TRUE,
+                include = TRUE)
+post_no_warm <- post[(stan_warmup+1):dim(post)[1], , ]
+keep <- seq(1, stan_iter - stan_warmup, by = 5) # keep one every 5 samples
+post_noac <- post_no_warm[keep, , ]
+
+# Estimated parameters
+alphas_pop <- rbind(post_noac[, 1, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")],
+                    post_noac[, 2, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")],
+                    post_noac[, 3, c("alpha_pop[1]", "alpha_pop[2]", "alpha_pop[3]")]) # shapes
+alphas_dp <- rbind(post_noac[, 1, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")],
+                   post_noac[, 2, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")],
+                   post_noac[, 3, c("alpha_dp_new[1]", "alpha_dp_new[2]", "alpha_dp_new[3]")]) # shapes
+alphas_dn <- rbind(post_noac[, 1, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")],
+                   post_noac[, 2, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")],
+                   post_noac[, 3, c("alpha_dn_new[1]", "alpha_dn_new[2]", "alpha_dn_new[3]")]) # shapes
+sigmas_pop <- rbind(post_noac[, 1, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")],
+                    post_noac[, 2, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")],
+                    post_noac[, 3, c("sigma_pop[1]", "sigma_pop[2]", "sigma_pop[3]")]) # scales
+sigmas_dp <- rbind(post_noac[, 1, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")],
+                   post_noac[, 2, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")],
+                   post_noac[, 3, c("sigma_dp_new[1]", "sigma_dp_new[2]", "sigma_dp_new[3]")]) # scales
+sigmas_dn <- rbind(post_noac[, 1, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")],
+                   post_noac[, 2, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")],
+                   post_noac[, 3, c("sigma_dn_new[1]", "sigma_dn_new[2]", "sigma_dn_new[3]")]) # scales
+
+# Estimated survival, hazard and cumulative hazard
+source("jTriLLogi_same_3rd_comp.R")
+attach(save.list)
+
+# Set the extrapolation times
+last.fit.time_dn <- round(dat_dn$time[nrow(dat_dn)])
+last.fit.time_dp <- round(dat_dp$time[nrow(dat_dp)])
+ext.horiz <- round(max(dat_pop$time)) # extrapolation until max external time
+extr.times_dn <- last.fit.time_dn+1:(ext.horiz-last.fit.time_dn)
+extr.times_dp <- last.fit.time_dp+1:(ext.horiz-last.fit.time_dp)
+
+# Fit of 3N
+fit.hazard_dn <- fit.lsurv_dn <- array(NA, dim = c(last.fit.time_dn, nrow(sigmas_pop), ncol(sigmas_pop)))
+fit.times_dn <- 1:last.fit.time_dn
+for(i in 1:last.fit.time_dn){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      fit.hazard_dn[i, j, k] <- h_llogi(fit.times_dn[i], alphas_dn[j, k], sigmas_dn[j, k])
+      fit.lsurv_dn[i, j, k] <- logS_llogi(fit.times_dn[i], alphas_dn[j, k], sigmas_dn[j, k])
+    }
+  }
+}
+fit.haz_dn <- apply(fit.hazard_dn, c(1, 2), sum)
+fit.sur_dn <- exp(apply(fit.lsurv_dn, c(1, 2), sum))
+fit.cumhaz_dn <- -apply(fit.lsurv_dn, c(1, 2), sum)
+
+# Fit of n3N
+fit.hazard_dp <- fit.lsurv_dp <- array(NA, dim = c(last.fit.time_dp, nrow(sigmas_pop), ncol(sigmas_pop)))
+fit.times_dp <- 1:last.fit.time_dp
+for(i in 1:last.fit.time_dp){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      fit.hazard_dp[i, j, k] <- h_llogi(fit.times_dp[i], alphas_dp[j, k], sigmas_dp[j, k])
+      fit.lsurv_dp[i, j, k] <- logS_llogi(fit.times_dp[i], alphas_dp[j, k], sigmas_dp[j, k]) 
+    }
+  }
+}
+fit.haz_dp <- apply(fit.hazard_dp, c(1, 2), sum)
+fit.sur_dp <- exp(apply(fit.lsurv_dp, c(1, 2), sum))
+fit.cumhaz_dp <- -apply(fit.lsurv_dp, c(1, 2), sum)
+
+# Fit of external
+fit.times_pop <- 1:ext.horiz
+fit.hazard_pop <- fit.lsurv_pop <- array(NA, dim = c(length(fit.times_pop), nrow(sigmas_pop), ncol(sigmas_pop)))
+for(i in 1:length(fit.times_pop)){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      fit.hazard_pop[i, j, k] <- h_llogi(fit.times_pop[i], alphas_pop[j, k], sigmas_pop[j, k])
+      fit.lsurv_pop[i, j, k] <- logS_llogi(fit.times_pop[i], alphas_pop[j, k], sigmas_pop[j, k]) 
+    }
+  }
+}
+tfit.haz_pop <- apply(fit.hazard_pop, c(1, 2), sum)
+tfit.sur_pop <- exp(apply(fit.lsurv_pop, c(1, 2), sum))
+tfit.cumhaz_pop <- -apply(fit.lsurv_pop, c(1, 2), sum)
+
+# Fit of external for the follow-up period of 3N
+fit.haz_pop.dn <- tfit.haz_pop[1:last.fit.time_dn, ]
+fit.sur_pop.dn <- tfit.sur_pop[1:last.fit.time_dn, ]
+fit.cumhaz_pop.dn <- tfit.cumhaz_pop[1:last.fit.time_dn, ]
+
+# Fit of external for the extrapolation period of 3N
+extr.haz_pop.dn <- tfit.haz_pop[(last.fit.time_dn+1):max(extr.times_dn), ]
+extr.sur_pop.dn <- tfit.sur_pop[(last.fit.time_dn+1):max(extr.times_dn), ]
+extr.cumhaz_pop.dn <- tfit.cumhaz_pop[(last.fit.time_dn+1):max(extr.times_dn), ]
+
+# Fit of external for the follow-up period of n3N
+fit.haz_pop.dp <- tfit.haz_pop[1:last.fit.time_dp, ]
+fit.sur_pop.dp <- tfit.sur_pop[1:last.fit.time_dp, ]
+fit.cumhaz_pop.dp <- tfit.cumhaz_pop[1:last.fit.time_dp, ]
+
+# Fit of external for the extrapolation period of n3N
+extr.haz_pop.dp <- tfit.haz_pop[(last.fit.time_dp+1):max(extr.times_dn), ]
+extr.sur_pop.dp <- tfit.sur_pop[(last.fit.time_dp+1):max(extr.times_dn), ]
+extr.cumhaz_pop.dp <- tfit.cumhaz_pop[(last.fit.time_dp+1):max(extr.times_dn), ]
+
+
+## Method 1: Extrapolate the fitted model ##
+
+
+# Extrapolation of 3N
+extr.hazard_dn <- extr.lsurv_dn <- array(NA, dim = c(length(extr.times_dn), nrow(sigmas_pop), ncol(sigmas_pop)))
+for(i in 1:length(extr.times_dn)){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      extr.hazard_dn[i, j, k] <- h_llogi(extr.times_dn[i], alphas_dn[j, k], sigmas_dn[j, k])
+      extr.lsurv_dn[i, j, k] <- logS_llogi(extr.times_dn[i], alphas_dn[j, k], sigmas_dn[j, k])
+    }
+  }
+}
+extr.haz_dn <- apply(extr.hazard_dn, c(1, 2), sum)
+extr.sur_dn <- exp(apply(extr.lsurv_dn, c(1, 2), sum))
+extr.cumhaz_dn <- -apply(extr.lsurv_dn, c(1, 2), sum)
+
+# Extrapolation of n3N
+extr.hazard_dp <- extr.lsurv_dp <- array(NA, dim = c(length(extr.times_dp), nrow(sigmas_pop), ncol(sigmas_pop)))
+for(i in 1:length(extr.times_dp)){
+  for(j in 1:nrow(sigmas_pop)){
+    for(k in 1:ncol(sigmas_pop)){
+      extr.hazard_dp[i, j, k] <- h_llogi(extr.times_dp[i], alphas_dp[j, k], sigmas_dp[j, k])
+      extr.lsurv_dp[i, j, k] <- logS_llogi(extr.times_dp[i], alphas_dp[j, k], sigmas_dp[j, k])
+    }
+  }
+}
+extr.haz_dp <- apply(extr.hazard_dp, c(1, 2), sum)
+extr.sur_dp <- exp(apply(extr.lsurv_dp, c(1, 2), sum))
+extr.cumhaz_dp <- -apply(extr.lsurv_dp, c(1, 2), sum)
+
+# Summary statistics
+fit.sur.dn.q3 <- apply(fit.sur_dn, 1, q3)
+fit.sur.dn.q4 <- apply(fit.sur_dn, 1, q4)
+fit.sur.dn.med <- apply(fit.sur_dn, 1, median)
+fit.haz.dn.q3 <- apply(fit.haz_dn, 1, q3)
+fit.haz.dn.q4 <- apply(fit.haz_dn, 1, q4)
+fit.haz.dn.med <- apply(fit.haz_dn, 1, median)
+fit.cumhaz.dn.q3 <- apply(fit.cumhaz_dn, 1, q3)
+fit.cumhaz.dn.q4 <- apply(fit.cumhaz_dn, 1, q4)
+fit.cumhaz.dn.med <- apply(fit.cumhaz_dn, 1, median)
+extr.sur.dn.q3 <- apply(extr.sur_dn, 1, q3)
+extr.sur.dn.q4 <- apply(extr.sur_dn, 1, q4)
+extr.sur.dn.med <- apply(extr.sur_dn, 1, median)
+extr.haz.dn.q3 <- apply(extr.haz_dn, 1, q3)
+extr.haz.dn.q4 <- apply(extr.haz_dn, 1, q4)
+extr.haz.dn.med <- apply(extr.haz_dn, 1, median)
+extr.cumhaz.dn.q3 <- apply(extr.cumhaz_dn, 1, q3)
+extr.cumhaz.dn.q4 <- apply(extr.cumhaz_dn, 1, q4)
+extr.cumhaz.dn.med <- apply(extr.cumhaz_dn, 1, median)
+
+fit.sur.dp.q3 <- apply(fit.sur_dp, 1, q3)
+fit.sur.dp.q4 <- apply(fit.sur_dp, 1, q4)
+fit.sur.dp.med <- apply(fit.sur_dp, 1, median)
+fit.haz.dp.q3 <- apply(fit.haz_dp, 1, q3)
+fit.haz.dp.q4 <- apply(fit.haz_dp, 1, q4)
+fit.haz.dp.med <- apply(fit.haz_dp, 1, median)
+fit.cumhaz.dp.q3 <- apply(fit.cumhaz_dp, 1, q3)
+fit.cumhaz.dp.q4 <- apply(fit.cumhaz_dp, 1, q4)
+fit.cumhaz.dp.med <- apply(fit.cumhaz_dp, 1, median)
+extr.sur.dp.q3 <- apply(extr.sur_dp, 1, q3)
+extr.sur.dp.q4 <- apply(extr.sur_dp, 1, q4)
+extr.sur.dp.med <- apply(extr.sur_dp, 1, median)
+extr.haz.dp.q3 <- apply(extr.haz_dp, 1, q3)
+extr.haz.dp.q4 <- apply(extr.haz_dp, 1, q4)
+extr.haz.dp.med <- apply(extr.haz_dp, 1, median)
+extr.cumhaz.dp.q3 <- apply(extr.cumhaz_dp, 1, q3)
+extr.cumhaz.dp.q4 <- apply(extr.cumhaz_dp, 1, q4)
+extr.cumhaz.dp.med <- apply(extr.cumhaz_dp, 1, median)
+
+fit.sur.pop.dn.q3 <- apply(fit.sur_pop.dn, 1, q3)
+fit.sur.pop.dn.q4 <- apply(fit.sur_pop.dn, 1, q4)
+fit.sur.pop.dn.med <- apply(fit.sur_pop.dn, 1, median)
+fit.haz.pop.dn.q3 <- apply(fit.haz_pop.dn, 1, q3)
+fit.haz.pop.dn.q4 <- apply(fit.haz_pop.dn, 1, q4)
+fit.haz.pop.dn.med <- apply(fit.haz_pop.dn, 1, median)
+fit.cumhaz.pop.dn.q3 <- apply(fit.cumhaz_pop.dn, 1, q3)
+fit.cumhaz.pop.dn.q4 <- apply(fit.cumhaz_pop.dn, 1, q4)
+fit.cumhaz.pop.dn.med <- apply(fit.cumhaz_pop.dn, 1, median)
+extr.sur.pop.dn.q3 <- apply(extr.sur_pop.dn, 1, q3)
+extr.sur.pop.dn.q4 <- apply(extr.sur_pop.dn, 1, q4)
+extr.sur.pop.dn.med <- apply(extr.sur_pop.dn, 1, median)
+extr.haz.pop.dn.q3 <- apply(extr.haz_pop.dn, 1, q3)
+extr.haz.pop.dn.q4 <- apply(extr.haz_pop.dn, 1, q4)
+extr.haz.pop.dn.med <- apply(extr.haz_pop.dn, 1, median)
+extr.cumhaz.pop.dn.q3 <- apply(extr.cumhaz_pop.dn, 1, q3)
+extr.cumhaz.pop.dn.q4 <- apply(extr.cumhaz_pop.dn, 1, q4)
+extr.cumhaz.pop.dn.med <- apply(extr.cumhaz_pop.dn, 1, median)
+
+fit.sur.pop.dp.q3 <- apply(fit.sur_pop.dp, 1, q3)
+fit.sur.pop.dp.q4 <- apply(fit.sur_pop.dp, 1, q4)
+fit.sur.pop.dp.med <- apply(fit.sur_pop.dp, 1, median)
+fit.haz.pop.dp.q3 <- apply(fit.haz_pop.dp, 1, q3)
+fit.haz.pop.dp.q4 <- apply(fit.haz_pop.dp, 1, q4)
+fit.haz.pop.dp.med <- apply(fit.haz_pop.dp, 1, median)
+fit.cumhaz.pop.dp.q3 <- apply(fit.cumhaz_pop.dp, 1, q3)
+fit.cumhaz.pop.dp.q4 <- apply(fit.cumhaz_pop.dp, 1, q4)
+fit.cumhaz.pop.dp.med <- apply(fit.cumhaz_pop.dp, 1, median)
+extr.sur.pop.dp.q3 <- apply(extr.sur_pop.dp, 1, q3)
+extr.sur.pop.dp.q4 <- apply(extr.sur_pop.dp, 1, q4)
+extr.sur.pop.dp.med <- apply(extr.sur_pop.dp, 1, median)
+extr.haz.pop.dp.q3 <- apply(extr.haz_pop.dp, 1, q3)
+extr.haz.pop.dp.q4 <- apply(extr.haz_pop.dp, 1, q4)
+extr.haz.pop.dp.med <- apply(extr.haz_pop.dp, 1, median)
+extr.cumhaz.pop.dp.q3 <- apply(extr.cumhaz_pop.dp, 1, q3)
+extr.cumhaz.pop.dp.q4 <- apply(extr.cumhaz_pop.dp, 1, q4)
+extr.cumhaz.pop.dp.med <- apply(extr.cumhaz_pop.dp, 1, median)
+
+
+# Life years gained #
+
+
+# Mean survival of 3N
+xx_dn <- c(fit.times_dn, extr.times_dn)
+fxx_dn <- rbind(fit.sur_dn, extr.sur_dn)
+area_dn <- matrix(NA, nrow = length(xx_dn), ncol = ncol(fxx_dn))
+for(i in 2:length(xx_dn)){
+  for(j in 1:ncol(fxx_dn)){
+    area_dn[i, j] <- (xx_dn[i] - xx_dn[i-1])*(fxx_dn[i-1, j] + fxx_dn[i, j])/2
+  }
+}
+t.area_dn <- apply(area_dn[-1, ], 2, sum)
+mean(t.area_dn)
+
+# Mean survival of n3N
+xx_dp <- c(fit.times_dp, extr.times_dp)
+fxx_dp <- rbind(fit.sur_dp, extr.sur_dp)
+area_dp <- matrix(NA, nrow = length(xx_dp), ncol = ncol(fxx_dp))
+for(i in 2:length(xx_dp)){
+  for(j in 1:ncol(fxx_dp)){
+    area_dp[i, j] <- (xx_dp[i] - xx_dp[i-1])*(fxx_dp[i-1, j] + fxx_dp[i, j])/2
+  }
+}
+t.area_dp <- apply(area_dp[-1, ], 2, sum)
+mean(t.area_dp)
+
+# Mean survival of external population
+xx_pop <- 1:ext.horiz
+fxx_pop <- tfit.sur_pop
+area_pop <- matrix(NA, nrow = length(xx_pop), ncol = ncol(fxx_pop))
+for(i in 2:length(xx_pop)){
+  for(j in 1:ncol(fxx_pop)){
+    area_pop[i, j] <- (xx_pop[i] - xx_pop[i-1])*(fxx_pop[i-1, j] + fxx_pop[i, j])/2
+  }
+}
+t.area_pop <- apply(area_pop[-1, ], 2, sum)
+mean(t.area_pop)
+
+mean(t.area_pop-t.area_dn)
+mean(t.area_pop-t.area_dp)
+
+# Life years gained
+lyg <- t.area_dp - t.area_dn
+
+
+## Method 2: Assume a constant difference h_p-h_pop ##
+
+
+avlast <- 5 # average the last avlast points
+chd <- function(y, x1 = fit.times_dn){
+  chd <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chd)
+}
+chd.fitted_dn <- apply(fit.haz_dn - fit.haz_pop.dn, 2, chd)
+chd.fitted_dp <- apply(fit.haz_dp - fit.haz_pop.dp, 2, chd, x1 = fit.times_dp)
+
+del.lag <- 1
+del.dn <- seq(last.fit.time_dn+1, nrow(tfit.haz_pop), by = del.lag)
+del.dp <- seq(last.fit.time_dp+1, nrow(tfit.haz_pop), by = del.lag)
+extr.haz.del_pop.dn <- tfit.haz_pop[del.dn, ]
+extr.haz.del_pop.dp <- tfit.haz_pop[del.dp, ]
+
+# Extrapolate
+mat.chd.del.fitted_dn <- matrix(rep(chd.fitted_dn, nrow(extr.haz.del_pop.dn)), nrow(extr.haz.del_pop.dn), ncol(extr.haz.del_pop.dn), byrow = TRUE)
+mat.chd.del.fitted_dp <- matrix(rep(chd.fitted_dp, nrow(extr.haz.del_pop.dp)), nrow(extr.haz.del_pop.dp), ncol(extr.haz.del_pop.dp), byrow = TRUE)
+
+extr.chd.del_dn_q3 <- apply(extr.haz.del_pop.dn + mat.chd.del.fitted_dn, 1, q3)
+extr.chd.del_dn_q4 <- apply(extr.haz.del_pop.dn + mat.chd.del.fitted_dn, 1, q4)
+extr.chd.del_dn_med <- apply(extr.haz.del_pop.dn + mat.chd.del.fitted_dn, 1, median)
+extr.chd.del_dp_q3 <- apply(extr.haz.del_pop.dp + mat.chd.del.fitted_dp, 1, q3)
+extr.chd.del_dp_q4 <- apply(extr.haz.del_pop.dp + mat.chd.del.fitted_dp, 1, q4)
+extr.chd.del_dp_med <- apply(extr.haz.del_pop.dp + mat.chd.del.fitted_dp, 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_dn <- rbind(fit.cumhaz_dn, matrix(0, nrow = nrow(extr.haz.del_pop.dn), ncol = ncol(extr.haz.del_pop.dn)))
+textr.cumhaz_dp <- rbind(fit.cumhaz_dp, matrix(0, nrow = nrow(extr.haz.del_pop.dp), ncol = ncol(extr.haz.del_pop.dp)))
+for(i in 1:nrow(extr.haz.del_pop.dn)){
+  textr.cumhaz_dn[i+nrow(fit.cumhaz_dn), ] <- textr.cumhaz_dn[i+nrow(fit.cumhaz_dn)-1, ] +
+    {extr.haz.del_pop.dn + mat.chd.del.fitted_dn}[i, ]
+}
+for(i in 1:nrow(extr.haz.del_pop.dp)){
+  textr.cumhaz_dp[i+nrow(fit.cumhaz_dp), ] <- textr.cumhaz_dp[i+nrow(fit.cumhaz_dp)-1, ] +
+    {extr.haz.del_pop.dp + mat.chd.del.fitted_dp}[i, ]
+}
+def.sur.chd.meth2_dn <- exp(-textr.cumhaz_dn)[(last.fit.time_dn+1):nrow(textr.cumhaz_dn), ]
+def.sur.chd.meth2_dp <- exp(-textr.cumhaz_dp)[(last.fit.time_dp+1):nrow(textr.cumhaz_dp), ]
+
+extr.sur.chd.q3.meth2_dn <- apply(def.sur.chd.meth2_dn, 1, q3)
+extr.sur.chd.q4.meth2_dn <- apply(def.sur.chd.meth2_dn, 1, q4)
+extr.sur.chd.med.meth2_dn <- apply(def.sur.chd.meth2_dn, 1, median)
+extr.sur.chd.q3.meth2_dp <- apply(def.sur.chd.meth2_dp, 1, q3)
+extr.sur.chd.q4.meth2_dp <- apply(def.sur.chd.meth2_dp, 1, q4)
+extr.sur.chd.med.meth2_dp <- apply(def.sur.chd.meth2_dp, 1, median)
+
+# Mean survival of 3N
+xx_dn <- c(fit.times_dn, extr.times_dn)
+fxx_dn <- rbind(fit.sur_dn, def.sur.chd.meth2_dn)
+area_dn <- matrix(NA, nrow = length(xx_dn), ncol = ncol(fxx_dn))
+for(i in 2:length(xx_dn)){
+  for(j in 1:ncol(fxx_dn)){
+    area_dn[i, j] <- (xx_dn[i] - xx_dn[i-1])*(fxx_dn[i-1, j] + fxx_dn[i, j])/2
+  }
+}
+t.area_dn.meth2 <- apply(area_dn[-1, ], 2, sum)
+mean(t.area_dn.meth2)
+
+# Mean survival of n3N
+xx_dp <- c(fit.times_dp, extr.times_dp)
+fxx_dp <- rbind(fit.sur_dp, def.sur.chd.meth2_dp)
+area_dp <- matrix(NA, nrow = length(xx_dp), ncol = ncol(fxx_dp))
+for(i in 2:length(xx_dp)){
+  for(j in 1:ncol(fxx_dp)){
+    area_dp[i, j] <- (xx_dp[i] - xx_dp[i-1])*(fxx_dp[i-1, j] + fxx_dp[i, j])/2
+  }
+}
+t.area_dp.meth2 <- apply(area_dp[-1, ], 2, sum)
+mean(t.area_dp.meth2)
+
+# Life years gained
+lyg.meth2 <- t.area_dp.meth2 - t.area_dn.meth2
+
+
+## Method 3: Assume a constant difference h1_p - h1_pop ##
+
+
+avlast <- 5 # average the last avlast points
+chd <- function(y, x1 = fit.times_dn){
+  chd <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chd)
+}
+chd.fitted2_dn <- apply(fit.hazard_dn[, , 1] - fit.hazard_pop[1:last.fit.time_dn, , 1], 2, chd)
+chd.fitted2_dp <- apply(fit.hazard_dp[, , 1] - fit.hazard_pop[1:last.fit.time_dp, , 1], 2, chd, x1 = fit.times_dp)
+
+del.lag <- 1
+del.dn <- seq(last.fit.time_dn+1, nrow(tfit.haz_pop), by = del.lag)
+del.dp <- seq(last.fit.time_dp+1, nrow(tfit.haz_pop), by = del.lag)
+extr2.haz.del_pop.dn <- fit.hazard_pop[del.dn, , 1]
+extr2.haz.del_pop.dp <- fit.hazard_pop[del.dp, , 1]
+
+# Extrapolate
+mat.chd.del.fitted2_dn <- matrix(rep(chd.fitted2_dn, nrow(extr2.haz.del_pop.dn)), nrow(extr2.haz.del_pop.dn), ncol(extr2.haz.del_pop.dn), byrow = TRUE)
+mat.chd.del.fitted2_dp <- matrix(rep(chd.fitted2_dp, nrow(extr2.haz.del_pop.dp)), nrow(extr2.haz.del_pop.dp), ncol(extr2.haz.del_pop.dp), byrow = TRUE)
+
+haz2_dn <- extr2.haz.del_pop.dn + mat.chd.del.fitted2_dn
+haz2_dp <- extr2.haz.del_pop.dp + mat.chd.del.fitted2_dp
+
+extr.chd.del2_dn_q3 <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, q3)
+extr.chd.del2_dn_q4 <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, q4)
+extr.chd.del2_dn_med <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, median)
+extr.chd.del2_dp_q3 <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, q3)
+extr.chd.del2_dp_q4 <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, q4)
+extr.chd.del2_dp_med <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_dn <- rbind(fit.cumhaz_dn, matrix(0, nrow = nrow(extr2.haz.del_pop.dn), ncol = ncol(extr2.haz.del_pop.dn)))
+textr.cumhaz_dp <- rbind(fit.cumhaz_dp, matrix(0, nrow = nrow(extr2.haz.del_pop.dp), ncol = ncol(extr2.haz.del_pop.dp)))
+for(i in 1:nrow(extr2.haz.del_pop.dn)){
+  textr.cumhaz_dn[i+nrow(fit.cumhaz_dn), ] <- textr.cumhaz_dn[i+nrow(fit.cumhaz_dn)-1, ] +
+    {extr2.haz.del_pop.dn + mat.chd.del.fitted2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3]}[i, ]
+}
+for(i in 1:nrow(extr2.haz.del_pop.dp)){
+  textr.cumhaz_dp[i+nrow(fit.cumhaz_dp), ] <- textr.cumhaz_dp[i+nrow(fit.cumhaz_dp)-1, ] +
+    {extr2.haz.del_pop.dp + mat.chd.del.fitted2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3]}[i, ]
+}
+def.sur.chd.meth3_dn <- exp(-textr.cumhaz_dn)[(last.fit.time_dn+1):nrow(textr.cumhaz_dn), ]
+def.sur.chd.meth3_dp <- exp(-textr.cumhaz_dp)[(last.fit.time_dp+1):nrow(textr.cumhaz_dp), ]
+
+extr.sur.chd.q3.meth3_dn <- apply(def.sur.chd.meth3_dn, 1, q3)
+extr.sur.chd.q4.meth3_dn <- apply(def.sur.chd.meth3_dn, 1, q4)
+extr.sur.chd.med.meth3_dn <- apply(def.sur.chd.meth3_dn, 1, median)
+extr.sur.chd.q3.meth3_dp <- apply(def.sur.chd.meth3_dp, 1, q3)
+extr.sur.chd.q4.meth3_dp <- apply(def.sur.chd.meth3_dp, 1, q4)
+extr.sur.chd.med.meth3_dp <- apply(def.sur.chd.meth3_dp, 1, median)
+
+# Mean survival of 3N
+xx_dn <- c(fit.times_dn, extr.times_dn)
+fxx_dn <- rbind(fit.sur_dn, def.sur.chd.meth3_dn)
+area_dn <- matrix(NA, nrow = length(xx_dn), ncol = ncol(fxx_dn))
+for(i in 2:length(xx_dn)){
+  for(j in 1:ncol(fxx_dn)){
+    area_dn[i, j] <- (xx_dn[i] - xx_dn[i-1])*(fxx_dn[i-1, j] + fxx_dn[i, j])/2
+  }
+}
+t.area_dn.meth3 <- apply(area_dn[-1, ], 2, sum)
+mean(t.area_dn.meth3)
+
+# Mean survival of mRNA
+xx_dp <- c(fit.times_dp, extr.times_dp)
+fxx_dp <- rbind(fit.sur_dp, def.sur.chd.meth3_dp)
+area_dp <- matrix(NA, nrow = length(xx_dp), ncol = ncol(fxx_dp))
+for(i in 2:length(xx_dp)){
+  for(j in 1:ncol(fxx_dp)){
+    area_dp[i, j] <- (xx_dp[i] - xx_dp[i-1])*(fxx_dp[i-1, j] + fxx_dp[i, j])/2
+  }
+}
+t.area_dp.meth3 <- apply(area_dp[-1, ], 2, sum)
+mean(t.area_dp.meth3)
+
+# Life years gained
+lyg.meth3 <- t.area_dp.meth3 - t.area_dn.meth3
+
+
+## Method 4: Assume a constant ratio h_pop/h_p ##
+
+
+avlast <- 5 # average the last avlast points
+chr <- function(y, x1 = fit.times_dn){
+  chr <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chr)
+}
+chr.fitted_dn <- apply(fit.haz_pop.dn / fit.haz_dn, 2, chr)
+chr.fitted_dp <- apply(fit.haz_pop.dp / fit.haz_dp, 2, chr, x1 = fit.times_dp)
+
+del.lag <- 1
+del.dn <- seq(last.fit.time_dn+1, nrow(tfit.haz_pop), by = del.lag)
+del.dp <- seq(last.fit.time_dp+1, nrow(tfit.haz_pop), by = del.lag)
+extr.haz.del_pop.dn <- tfit.haz_pop[del.dn, ]
+extr.haz.del_pop.dp <- tfit.haz_pop[del.dp, ]
+
+# Extrapolate
+mat.chr.del.fitted_dn <- matrix(rep(chr.fitted_dn, nrow(extr.haz.del_pop.dn)), nrow(extr.haz.del_pop.dn), ncol(extr.haz.del_pop.dn), byrow = TRUE)
+mat.chr.del.fitted_dp <- matrix(rep(chr.fitted_dp, nrow(extr.haz.del_pop.dp)), nrow(extr.haz.del_pop.dp), ncol(extr.haz.del_pop.dp), byrow = TRUE)
+
+extr.chr.del_dn_q3 <- apply(extr.haz.del_pop.dn / mat.chr.del.fitted_dn, 1, q3)
+extr.chr.del_dn_q4 <- apply(extr.haz.del_pop.dn / mat.chr.del.fitted_dn, 1, q4)
+extr.chr.del_dn_med <- apply(extr.haz.del_pop.dn / mat.chr.del.fitted_dn, 1, median)
+extr.chr.del_dp_q3 <- apply(extr.haz.del_pop.dp / mat.chr.del.fitted_dp, 1, q3)
+extr.chr.del_dp_q4 <- apply(extr.haz.del_pop.dp / mat.chr.del.fitted_dp, 1, q4)
+extr.chr.del_dp_med <- apply(extr.haz.del_pop.dp / mat.chr.del.fitted_dp, 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_dn <- rbind(fit.cumhaz_dn, matrix(0, nrow = nrow(extr.haz.del_pop.dn), ncol = ncol(extr.haz.del_pop.dn)))
+textr.cumhaz_dp <- rbind(fit.cumhaz_dp, matrix(0, nrow = nrow(extr.haz.del_pop.dp), ncol = ncol(extr.haz.del_pop.dp)))
+for(i in 1:nrow(extr.haz.del_pop.dn)){
+  textr.cumhaz_dn[i+nrow(fit.cumhaz_dn), ] <- textr.cumhaz_dn[i+nrow(fit.cumhaz_dn)-1, ] +
+    {extr.haz.del_pop.dn / mat.chr.del.fitted_dn}[i, ]
+}
+for(i in 1:nrow(extr.haz.del_pop.dp)){
+  textr.cumhaz_dp[i+nrow(fit.cumhaz_dp), ] <- textr.cumhaz_dp[i+nrow(fit.cumhaz_dp)-1, ] +
+    {extr.haz.del_pop.dp / mat.chr.del.fitted_dp}[i, ]
+}
+def.sur.chr.meth4_dn <- exp(-textr.cumhaz_dn)[(last.fit.time_dn+1):nrow(textr.cumhaz_dn), ]
+def.sur.chr.meth4_dp <- exp(-textr.cumhaz_dp)[(last.fit.time_dp+1):nrow(textr.cumhaz_dp), ]
+
+extr.sur.chr.q3.meth4_dn <- apply(def.sur.chr.meth4_dn, 1, q3)
+extr.sur.chr.q4.meth4_dn <- apply(def.sur.chr.meth4_dn, 1, q4)
+extr.sur.chr.med.meth4_dn <- apply(def.sur.chr.meth4_dn, 1, median)
+extr.sur.chr.q3.meth4_dp <- apply(def.sur.chr.meth4_dp, 1, q3)
+extr.sur.chr.q4.meth4_dp <- apply(def.sur.chr.meth4_dp, 1, q4)
+extr.sur.chr.med.meth4_dp <- apply(def.sur.chr.meth4_dp, 1, median)
+
+# Mean survival of 3N
+xx_dn <- c(fit.times_dn, extr.times_dn)
+fxx_dn <- rbind(fit.sur_dn, def.sur.chr.meth4_dn)
+area_dn <- matrix(NA, nrow = length(xx_dn), ncol = ncol(fxx_dn))
+for(i in 2:length(xx_dn)){
+  for(j in 1:ncol(fxx_dn)){
+    area_dn[i, j] <- (xx_dn[i] - xx_dn[i-1])*(fxx_dn[i-1, j] + fxx_dn[i, j])/2
+  }
+}
+t.area_dn.meth4 <- apply(area_dn[-1, ], 2, sum)
+mean(t.area_dn.meth4)
+
+# Mean survival of n3N
+xx_dp <- c(fit.times_dp, extr.times_dp)
+fxx_dp <- rbind(fit.sur_dp, def.sur.chr.meth4_dp)
+area_dp <- matrix(NA, nrow = length(xx_dp), ncol = ncol(fxx_dp))
+for(i in 2:length(xx_dp)){
+  for(j in 1:ncol(fxx_dp)){
+    area_dp[i, j] <- (xx_dp[i] - xx_dp[i-1])*(fxx_dp[i-1, j] + fxx_dp[i, j])/2
+  }
+}
+t.area_dp.meth4 <- apply(area_dp[-1, ], 2, sum)
+mean(t.area_dp.meth4)
+
+# Life years gained
+lyg.meth4 <- t.area_dp.meth4 - t.area_dn.meth4
+
+
+## Method 5: Assume a constant ratio h1_pop / h1_p ##
+
+
+chr <- function(y, x1 = fit.times_dn){
+  chr <- mean(y[(length(x1)-avlast+1):length(x1)])
+  
+  return(chr)
+}
+chr.fitted2_dn <- apply(fit.hazard_pop[1:last.fit.time_dn, , 1] / fit.hazard_dn[, , 1], 2, chr)
+chr.fitted2_dp <- apply(fit.hazard_pop[1:last.fit.time_dp, , 1] / fit.hazard_dp[, , 1], 2, chr, x1 = fit.times_dp)
+
+del.lag <- 1
+del.dn <- seq(last.fit.time_dn+1, nrow(tfit.haz_pop), by = del.lag)
+del.dp <- seq(last.fit.time_dp+1, nrow(tfit.haz_pop), by = del.lag)
+extr2.haz.del_pop.dn <- fit.hazard_pop[del.dn, , 1]
+extr2.haz.del_pop.dp <- fit.hazard_pop[del.dp, , 1]
+
+# Extrapolate
+mat.chr.del.fitted2_dn <- matrix(rep(chr.fitted2_dn, nrow(extr2.haz.del_pop.dn)), nrow(extr2.haz.del_pop.dn), ncol(extr2.haz.del_pop.dn), byrow = TRUE)
+mat.chr.del.fitted2_dp <- matrix(rep(chr.fitted2_dp, nrow(extr2.haz.del_pop.dp)), nrow(extr2.haz.del_pop.dp), ncol(extr2.haz.del_pop.dp), byrow = TRUE)
+
+haz2_dn <- extr2.haz.del_pop.dn / mat.chr.del.fitted2_dn
+haz2_dp <- extr2.haz.del_pop.dp / mat.chr.del.fitted2_dp
+
+extr.chr.del2_dn_q3 <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, q3)
+extr.chr.del2_dn_q4 <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, q4)
+extr.chr.del2_dn_med <- apply(haz2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3], 1, median)
+extr.chr.del2_dp_q3 <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, q3)
+extr.chr.del2_dp_q4 <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, q4)
+extr.chr.del2_dp_med <- apply(haz2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3], 1, median)
+
+# Survival function using cumulative hazard
+textr.cumhaz_dn <- rbind(fit.cumhaz_dn, matrix(0, nrow = nrow(extr2.haz.del_pop.dn), ncol = ncol(extr2.haz.del_pop.dn)))
+textr.cumhaz_dp <- rbind(fit.cumhaz_dp, matrix(0, nrow = nrow(extr2.haz.del_pop.dp), ncol = ncol(extr2.haz.del_pop.dp)))
+for(i in 1:nrow(extr2.haz.del_pop.dn)){
+  textr.cumhaz_dn[i+nrow(fit.cumhaz_dn), ] <- textr.cumhaz_dn[i+nrow(fit.cumhaz_dn)-1, ] +
+    {extr2.haz.del_pop.dn / mat.chr.del.fitted2_dn + extr.hazard_dn[, , 2] + extr.hazard_dn[, , 3]}[i, ]
+}
+for(i in 1:nrow(extr2.haz.del_pop.dp)){
+  textr.cumhaz_dp[i+nrow(fit.cumhaz_dp), ] <- textr.cumhaz_dp[i+nrow(fit.cumhaz_dp)-1, ] +
+    {extr2.haz.del_pop.dp / mat.chr.del.fitted2_dp + extr.hazard_dp[, , 2] + extr.hazard_dp[, , 3]}[i, ]
+}
+def.sur.chr.meth5_dn <- exp(-textr.cumhaz_dn)[(last.fit.time_dn+1):nrow(textr.cumhaz_dn), ]
+def.sur.chr.meth5_dp <- exp(-textr.cumhaz_dp)[(last.fit.time_dp+1):nrow(textr.cumhaz_dp), ]
+
+extr.sur.chr.q3.meth5_dn <- apply(def.sur.chr.meth5_dn, 1, q3)
+extr.sur.chr.q4.meth5_dn <- apply(def.sur.chr.meth5_dn, 1, q4)
+extr.sur.chr.med.meth5_dn <- apply(def.sur.chr.meth5_dn, 1, median)
+extr.sur.chr.q3.meth5_dp <- apply(def.sur.chr.meth5_dp, 1, q3)
+extr.sur.chr.q4.meth5_dp <- apply(def.sur.chr.meth5_dp, 1, q4)
+extr.sur.chr.med.meth5_dp <- apply(def.sur.chr.meth5_dp, 1, median)
+
+# Mean survival of 3N
+xx_dn <- c(fit.times_dn, extr.times_dn)
+fxx_dn <- rbind(fit.sur_dn, def.sur.chr.meth5_dn)
+area_dn <- matrix(NA, nrow = length(xx_dn), ncol = ncol(fxx_dn))
+for(i in 2:length(xx_dn)){
+  for(j in 1:ncol(fxx_dn)){
+    area_dn[i, j] <- (xx_dn[i] - xx_dn[i-1])*(fxx_dn[i-1, j] + fxx_dn[i, j])/2
+  }
+}
+t.area_dn.meth5 <- apply(area_dn[-1, ], 2, sum)
+mean(t.area_dn.meth5)
+
+# Mean survival of n3N
+xx_dp <- c(fit.times_dp, extr.times_dp)
+fxx_dp <- rbind(fit.sur_dp, def.sur.chr.meth5_dp)
+area_dp <- matrix(NA, nrow = length(xx_dp), ncol = ncol(fxx_dp))
+for(i in 2:length(xx_dp)){
+  for(j in 1:ncol(fxx_dp)){
+    area_dp[i, j] <- (xx_dp[i] - xx_dp[i-1])*(fxx_dp[i-1, j] + fxx_dp[i, j])/2
+  }
+}
+t.area_dp.meth5 <- apply(area_dp[-1, ], 2, sum)
+mean(t.area_dp.meth5)
+
+# Life years gained
+lyg.meth5 <- t.area_dp.meth5 - t.area_dn.meth5
+
+
+## Results ##
+
+
+# Hazard function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_dn,
+                              y = fit.haz.dn.med,
+                              z = "3N"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = fit.times_dp,
+                              y = fit.haz.dp.med,
+                              z = "n3N"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = 1:ext.horiz,
+                              y = c(fit.haz.pop.dn.med, extr.haz.pop.dn.med),
+                              z = "external"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = extr.times_dn,
+                              y = extr.haz.dn.med,
+                              z = "3N",
+                              g = "mod"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = extr.times_dp,
+                              y = extr.haz.dp.med,
+                              z = "n3N",
+                              g = "mod"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.chd.del_dn_med,
+                              z = "3N",
+                              g = "diff"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.chd.del_dp_med,
+                              z = "n3N",
+                              g = "diff"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.chd.del2_dn_med,
+                              z = "3N",
+                              g = "diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.chd.del2_dp_med,
+                              z = "n3N",
+                              g = "diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.chr.del_dn_med,
+                              z = "3N",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.chr.del_dp_med,
+                              z = "n3N",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.chr.del2_dn_med,
+                              z = "3N",
+                              g = "ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.chr.del2_dp_med,
+                              z = "n3N",
+                              g = "ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  scale_linetype_manual(values = c("solid", "dotdash", "dotted"),
+                        name = NULL,
+                        breaks = c("n3N", "3N", "external"),
+                        labels = c("n3N", "3N", "external")) +
+  scale_color_manual(values = c("red2", "blue", "tan4", "seagreen", "goldenrod1"),
+                     name = NULL,
+                     breaks = c("mod", "diff", "diff.cs", "ratio", "ratio.cs"),
+                     labels = c("mod", "diff", "diff.cs", "ratio", "ratio.cs")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 0.07, by = 0.005)) +
+  coord_cartesian(ylim = c(0, 0.07), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Hazard",
+       title = NULL) +
+  theme(legend.title = element_blank(),
+        axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("3n_extr_haz_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Survival function
+ggplot() +
+  geom_line(data = data.frame(x = fit.times_dn,
+                              y = fit.sur.dn.med,
+                              z = "3N"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = fit.times_dp,
+                              y = fit.sur.dp.med,
+                              z = "n3N"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = 1:ext.horiz,
+                              y = c(fit.sur.pop.dn.med, extr.sur.pop.dn.med),
+                              z = "external"),
+            aes(x = x, y = y, linetype = z)) +
+  geom_line(data = data.frame(x = extr.times_dn,
+                              y = extr.sur.dn.med,
+                              z = "3N",
+                              g = "mod"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = extr.times_dp,
+                              y = extr.sur.dp.med,
+                              z = "n3N",
+                              g = "mod"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.sur.chd.med.meth2_dn,
+                              z = "3N",
+                              g = "diff"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.sur.chd.med.meth2_dp,
+                              z = "n3N",
+                              g = "diff"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.sur.chd.med.meth3_dn,
+                              z = "3N",
+                              g = "diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.sur.chd.med.meth3_dp,
+                              z = "n3N",
+                              g = "diff.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.sur.chr.med.meth4_dn,
+                              z = "3N",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.sur.chr.med.meth4_dp,
+                              z = "n3N",
+                              g = "ratio"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dn:(last.fit.time_dn+length(del.dn)-1),
+                              y = extr.sur.chr.med.meth5_dn,
+                              z = "3N",
+                              g = "ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  geom_line(data = data.frame(x = last.fit.time_dp:(last.fit.time_dp+length(del.dp)-1),
+                              y = extr.sur.chr.med.meth5_dp,
+                              z = "n3N",
+                              g = "ratio.cs"),
+            aes(x = x, y = y, linetype = z, color = g)) +
+  scale_linetype_manual(values = c("solid", "dotdash", "dotted"),
+                        name = NULL,
+                        breaks = c("n3N", "3N", "external"),
+                        labels = c("n3N", "3N", "external")) +
+  scale_color_manual(values = c("red2", "blue", "tan4", "seagreen", "goldenrod1"),
+                     name = NULL,
+                     breaks = c("mod", "diff", "diff.cs", "ratio", "ratio.cs"),
+                     labels = c("mod", "diff", "diff.cs", "ratio", "ratio.cs")) +
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, 40*12, by = 24),
+                     labels = seq(0, 40*12, by = 24)/12) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1)) +
+  coord_cartesian(ylim = c(0, 1), xlim = c(0, 40*12)) +
+  labs(x = "Time (years)",
+       y = "Survival",
+       title = NULL) +
+  theme(axis.title = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("3n_extr_surv_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Life years gained
+ggplot(data = data.frame(x = c(lyg, lyg.meth2, lyg.meth3, lyg.meth4, lyg.meth5),
+                         y = rep(c("mod", "diff", "diff.cs", "ratio", "ratio.cs"), each = length(lyg))),
+       aes(x = x, color = y)) +
+  stat_density(aes(x = x), geom = "line", position = "identity") +
+  scale_color_manual(values = c("goldenrod1", "dodgerblue", "tan4", "tomato", "forestgreen"),
+                     name = NULL,
+                     breaks = c("mod", "diff", "diff.cs", "ratio", "ratio.cs"),
+                     labels = c("mod", "diff", "diff.cs", "ratio", "ratio.cs")) +
+  scale_x_continuous(breaks = seq(-10, 40, by = 5)) +
+  theme_bw() +
+  labs(x = "Time (months)",
+       y = "density",
+       title = "Life Years Gained") +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title.x = element_text(size = 14),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", linewidth = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("3n_lyg.dens_meth_pub.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
